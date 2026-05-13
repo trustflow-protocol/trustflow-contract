@@ -1,7 +1,0 @@
-{
-  "name": "trustflow-backend",
-  "version": "1.0.0",
-  "description": "Node.js API for TrustFlow off-chain data.",
-  "main": "src/index.js",
-  "license": "MIT"
-}
