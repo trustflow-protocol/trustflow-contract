@@ -29,7 +29,9 @@ jobs:
 
       - name: Install Soroban CLI
         run: |
-          cargo install --locked soroban-cli@21.0.0 --features opt
+          mkdir -p ~/.local/bin
+          curl -L https://github.com/stellar/soroban-tools/releases/download/v21.0.0/soroban-cli-21.0.0-x86_64-unknown-linux-gnu.tar.gz | tar -xz -C ~/.local/bin
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
 
       - name: Cache cargo registry
         uses: actions/cache@v4
