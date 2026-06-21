@@ -1,4 +1,5 @@
 name: Lint and Build
+# Checks code formatting, linting, and WASM build for all contracts
 
 on:
   pull_request:
