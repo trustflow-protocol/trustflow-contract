@@ -1,2 +1,17 @@
 
 # TrustFlow core contract dependencies pinned for reproducibility
+[package]
+name = "trustflow-core"
+description = "TrustFlow escrow core contract"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
