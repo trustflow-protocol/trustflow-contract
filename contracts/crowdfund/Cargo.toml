@@ -12,6 +12,6 @@ crate-type = ["cdylib"]
 [dependencies]
 soroban-sdk = { workspace = true }
 
-[dev_dependencies]
+[dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 rand = { version = "0.7.3" }

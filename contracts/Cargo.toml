@@ -1,2 +1,21 @@
+[workspace]
+resolver = "2"
 
-# TrustFlow core contract dependencies pinned for reproducibility
+members = ["abundance", "crowdfund"]
+
+[workspace.package]
+rust-version = "1.74.0"
+
+[workspace.dependencies]
+soroban-sdk = "20.0.0-rc2"
+soroban-token-sdk = "20.0.0-rc2"
+
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+debug = 0
+strip = "symbols"
+debug-assertions = false
+panic = "abort"
+codegen-units = 1
+lto = true

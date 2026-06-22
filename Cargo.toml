@@ -1,8 +1,6 @@
 [workspace]
 resolver = "2"
 
-members = ["contracts/abundance", "contracts/crowdfund"]
-
 [workspace.package]
 rust-version = "1.74.0"
 
