@@ -1,7 +1,7 @@
 #![no_std]
 
 //! Mock Token Contract for Testing
-//! 
+//!
 //! A simple Stellar Asset Contract (SAC) compliant token implementation
 //! designed for testing escrow and payment flows with USDC-like behavior.
 
