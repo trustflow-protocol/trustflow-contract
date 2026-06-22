@@ -46,9 +46,11 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all --check
+        working-directory: contracts
 
       - name: Run clippy
         run: cargo clippy --all-targets --all-features --workspace
+        working-directory: contracts
 
       - name: Build all WASM contracts
         run: |
