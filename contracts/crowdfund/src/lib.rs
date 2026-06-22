@@ -7,23 +7,35 @@ mod events;
 mod test;
 mod testutils;
 
+/// Storage keys for the crowdfund contract
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
+    /// Campaign deadline (ledger timestamp)
     Deadline,
+    /// Address that will receive funds if target is met
     Recipient,
+    /// Whether the campaign has started
     Started,
+    /// Funding target amount to be reached
     Target,
+    /// Token contract address for contributions
     Token,
+    /// Amount contributed by a specific user
     User(Address),
+    /// Whether the recipient has claimed the funds
     RecipientClaimed,
 }
 
+/// Current state of the crowdfund campaign
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum State {
+    /// Campaign is active and accepting contributions
     Running = 0,
+    /// Target reached, funds can be claimed by recipient
     Success = 1,
+    /// Deadline passed without reaching target, refunds available
     Expired = 2,
 }
 
