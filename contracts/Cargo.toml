@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 
-members = ["abundance", "crowdfund"]
+members = ["abundance", "crowdfund", "mock-token"]
 
 [workspace.package]
 rust-version = "1.74.0"
