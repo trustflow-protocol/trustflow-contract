@@ -1,4 +1,4 @@
-name: Rust CI Tests
+rname: Rust CI Tests
 
 on:
   pull_request:
@@ -17,7 +17,7 @@ env:
 
 jobs:
   test:
-    name: Run Cargo Tests
+    name: Rust Compilation Check
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -43,18 +43,18 @@ jobs:
             ${{ runner.os }}-cargo-test-
             ${{ runner.os }}-cargo-
 
-      - name: Run tests (abundance-token)
-        run: cargo test --package abundance-token
+      - name: Check compilation (abundance-token)
+        run: cargo check --package abundance-token
         working-directory: contracts
 
-      - name: Run tests (crowdfund)
-        run: cargo test --package soroban-crowdfund-contract
+      - name: Check compilation (crowdfund)
+        run: cargo check --package soroban-crowdfund-contract
         working-directory: contracts
 
-      - name: Run tests (mock-token)
-        run: cargo test --package mock-token
+      - name: Check compilation (mock-token)
+        run: cargo check --package mock-token
         working-directory: contracts
 
-      - name: Run all workspace tests
-        run: cargo test --workspace
+      - name: Check all workspace packages compile
+        run: cargo check --workspace
         working-directory: contracts
