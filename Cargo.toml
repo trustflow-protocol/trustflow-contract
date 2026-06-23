@@ -17,3 +17,4 @@ lto = true
 [workspace.dependencies]
 soroban-sdk = "20.0.0-rc2"
 soroban-token-sdk = "20.0.0-rc2"
+
