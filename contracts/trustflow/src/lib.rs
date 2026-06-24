@@ -1,7 +1,7 @@
 #![cfg_attr(not(test), no_std)]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, vec, Address, Env, String, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, symbol_short, token, Address, Env, String, Vec,
 };
 
 /// Slash rate in basis points applied to minority voters (10% = 1000 bps)
@@ -24,6 +24,21 @@ pub enum TrustFlowError {
     AlreadyVoted = 7,
     InsufficientStake = 8,
     NoVotesCast = 9,
+    MilestoneAmountMismatch = 10,
+}
+
+// ---------------------------------------------------------------------------
+// Events
+// ---------------------------------------------------------------------------
+
+#[contractevent]
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct EscrowInitialized {
+    pub escrow_id: u64,
+    pub depositor: Address,
+    pub beneficiary: Address,
+    pub amount: i128,
 }
 
 // ---------------------------------------------------------------------------
@@ -77,6 +92,14 @@ pub enum EscrowStatus {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Milestone {
+    pub label: String,
+    pub amount: i128,
+    pub approved: bool,
+}
+
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct EscrowRecord {
     pub id: u64,
@@ -84,6 +107,7 @@ pub struct EscrowRecord {
     pub beneficiary: Address,
     pub amount: i128,
     pub status: EscrowStatus,
+    pub milestones: Vec<Milestone>,
 }
 
 #[contracttype]
