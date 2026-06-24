@@ -1041,4 +1041,41 @@ mod tests {
         // 100% slash: stake should be zero, not negative
         assert_eq!(client.get_stake(&malicious), 0);
     }
+
+    #[test]
+    fn test_init_escrow_with_milestones() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+
+        mint(&sac, &depositor, 1_000);
+
+        let milestones = Vec::from_array(
+            &env,
+            [
+                Milestone {
+                    label: String::from_slice(&env, "Design"),
+                    amount: 400,
+                    approved: false,
+                },
+                Milestone {
+                    label: String::from_slice(&env, "Development"),
+                    amount: 600,
+                    approved: false,
+                },
+            ],
+        );
+
+        let escrow_id = client.init_escrow(&depositor, &beneficiary, &milestones);
+
+        // Verify balance transfer
+        assert_eq!(balance(&env, &token_addr, &depositor), 0);
+        assert_eq!(balance(&env, &token_addr, &client.address), 1_000);
+
+        // Verify escrow ID increment
+        assert_eq!(escrow_id, 1);
+    }
 }
