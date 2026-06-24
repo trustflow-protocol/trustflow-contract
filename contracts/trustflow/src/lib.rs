@@ -246,8 +246,70 @@ impl TrustFlow {
                 beneficiary,
                 amount,
                 status: EscrowStatus::Active,
+                milestones: Vec::new(&env),
             },
         );
+        Ok(id)
+    }
+
+    /// Initialise an escrow with specific milestones and lock `amount` tokens.
+    pub fn init_escrow(
+        env: Env,
+        depositor: Address,
+        beneficiary: Address,
+        milestones: Vec<Milestone>,
+    ) -> Result<u64, TrustFlowError> {
+        depositor.require_auth();
+
+        let mut total_amount: i128 = 0;
+        for m in milestones.iter() {
+            if m.amount <= 0 {
+                return Err(TrustFlowError::InvalidAmount);
+            }
+            total_amount += m.amount;
+        }
+
+        if total_amount <= 0 {
+            return Err(TrustFlowError::InvalidAmount);
+        }
+
+        let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        token::Client::new(&env, &token).transfer(
+            &depositor,
+            &env.current_contract_address(),
+            &total_amount,
+        );
+
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowCounter)
+            .unwrap_or(0);
+        let id = counter + 1;
+        env.storage().instance().set(&DataKey::EscrowCounter, &id);
+
+        env.storage().persistent().set(
+            &DataKey::Escrow(id),
+            &EscrowRecord {
+                id,
+                depositor: depositor.clone(),
+                beneficiary: beneficiary.clone(),
+                amount: total_amount,
+                status: EscrowStatus::Active,
+                milestones,
+            },
+        );
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("init")),
+            EscrowInitialized {
+                escrow_id: id,
+                depositor,
+                beneficiary,
+                amount: total_amount,
+            },
+        );
+
         Ok(id)
     }
 
@@ -345,7 +407,7 @@ impl TrustFlow {
             .storage()
             .persistent()
             .get(&DataKey::DisputeVoters(escrow_id))
-            .unwrap_or_else(|| vec![&env]);
+            .unwrap_or_else(|| Vec::new(&env));
         voters.push_back(juror);
         env.storage()
             .persistent()
@@ -376,7 +438,7 @@ impl TrustFlow {
             .storage()
             .persistent()
             .get(&DataKey::DisputeVoters(escrow_id))
-            .unwrap_or_else(|| vec![&env]);
+            .unwrap_or_else(|| Vec::new(&env));
         if voters.is_empty() {
             return Err(TrustFlowError::NoVotesCast);
         }
