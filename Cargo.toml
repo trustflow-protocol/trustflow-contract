@@ -1,12 +1,6 @@
 [workspace]
 resolver = "2"
 
-members = [
-    "contracts",
-    "contracts/abundance",
-    "contracts/crowdfund",
-]
-
 [workspace.package]
 rust-version = "1.74.0"
 
@@ -23,3 +17,4 @@ lto = true
 [workspace.dependencies]
 soroban-sdk = "20.0.0-rc2"
 soroban-token-sdk = "20.0.0-rc2"
+

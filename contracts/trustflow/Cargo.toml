@@ -1,7 +1,6 @@
 [package]
-name = "abundance-token"
-description = "Soroban standard token contract, but anyone can mint to themselves."
-version = "0.0.6"
+name = "trustflow"
+version = "0.1.0"
 edition = "2021"
 rust-version.workspace = true
 
@@ -10,7 +9,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
-soroban-token-sdk = { workspace = true }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }

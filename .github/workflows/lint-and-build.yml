@@ -1,0 +1,68 @@
+name: Lint and Build
+
+on:
+  pull_request:
+    paths:
+      - "contracts/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  push:
+    branches:
+      - main
+      - master
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+
+      - name: Install Soroban CLI
+        run: |
+          mkdir -p ~/.local/bin
+          curl -L https://github.com/stellar/soroban-tools/releases/download/v21.0.0/soroban-cli-21.0.0-x86_64-unknown-linux-gnu.tar.gz | tar -xz -C ~/.local/bin
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+        working-directory: contracts
+
+      - name: Run clippy
+        run: cargo clippy --all-features --workspace --lib
+        working-directory: contracts
+
+      - name: Build all WASM contracts
+        run: |
+          cd contracts
+          for contract in abundance crowdfund mock-token; do
+            echo "Building $contract..."
+            cd $contract
+            soroban contract build
+            cd ..
+          done
+
+      - name: Verify WASM files exist
+        run: |
+          ls -lh target/wasm32-unknown-unknown/release/*.wasm
+        working-directory: contracts
