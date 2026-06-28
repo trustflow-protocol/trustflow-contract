@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address};
+use soroban_sdk::contracttype;
 
 /// Storage keys for the TrustFlow escrow contract
 ///
@@ -39,6 +39,8 @@ pub const PERSISTENT_THRESHOLD: u32 = 120_960;
 /// * `key` - Storage key to extend
 pub fn extend_ttl(env: &soroban_sdk::Env, key: &DataKey) {
     if env.storage().persistent().has(key) {
-        env.storage().persistent().extend_ttl(key, PERSISTENT_THRESHOLD, PERSISTENT_BUMP);
+        env.storage()
+            .persistent()
+            .bump(key, PERSISTENT_THRESHOLD, PERSISTENT_BUMP);
     }
 }
