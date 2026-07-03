@@ -1,11 +1,14 @@
 #![cfg_attr(not(test), no_std)]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, vec, Address, Env, String, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, vec, Address, Env,
+    String, Vec,
 };
 
 /// Slash rate in basis points applied to minority voters (10% = 1000 bps)
 const DEFAULT_SLASH_BPS: u32 = 1_000;
+/// Minimum locked token balance required before a juror can vote on disputes.
+const MIN_JUROR_STAKE: i128 = 100;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -142,15 +145,21 @@ impl TrustFlow {
             .persistent()
             .get(&DataKey::JurorStake(juror.clone()))
             .unwrap_or(0);
+        let new_total = prev + amount;
         env.storage()
             .persistent()
-            .set(&DataKey::JurorStake(juror), &(prev + amount));
+            .set(&DataKey::JurorStake(juror.clone()), &new_total);
+        env.events()
+            .publish((symbol_short!("stake"), juror), new_total);
         Ok(())
     }
 
     /// Withdraw `amount` tokens that have not been slashed.
     pub fn unstake(env: Env, juror: Address, amount: i128) -> Result<(), TrustFlowError> {
         juror.require_auth();
+        if amount <= 0 {
+            return Err(TrustFlowError::InvalidAmount);
+        }
         let current: i128 = env
             .storage()
             .persistent()
@@ -161,9 +170,12 @@ impl TrustFlow {
         }
         let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         token::Client::new(&env, &token).transfer(&env.current_contract_address(), &juror, &amount);
+        let new_total = current - amount;
         env.storage()
             .persistent()
-            .set(&DataKey::JurorStake(juror), &(current - amount));
+            .set(&DataKey::JurorStake(juror.clone()), &new_total);
+        env.events()
+            .publish((symbol_short!("unstake"), juror), new_total);
         Ok(())
     }
 
@@ -173,6 +185,16 @@ impl TrustFlow {
             .persistent()
             .get(&DataKey::JurorStake(juror))
             .unwrap_or(0)
+    }
+
+    /// Return the minimum locked stake required for dispute voting.
+    pub fn get_min_juror_stake(_env: Env) -> i128 {
+        MIN_JUROR_STAKE
+    }
+
+    /// Return whether `juror` has enough locked stake to vote on disputes.
+    pub fn is_juror_eligible(env: Env, juror: Address) -> bool {
+        Self::get_stake(env, juror) >= MIN_JUROR_STAKE
     }
 
     /// Return how many times `juror` has been slashed.
@@ -270,8 +292,8 @@ impl TrustFlow {
         Ok(())
     }
 
-    /// Cast a vote on an open dispute.  The calling juror must have a positive
-    /// stake balance before voting.
+    /// Cast a vote on an open dispute.  The calling juror must have at least
+    /// `MIN_JUROR_STAKE` tokens locked before voting.
     ///
     /// * `vote_for_depositor` – `true` rules in favour of the depositor;
     ///   `false` rules in favour of the beneficiary.
@@ -288,7 +310,7 @@ impl TrustFlow {
             .persistent()
             .get(&DataKey::JurorStake(juror.clone()))
             .unwrap_or(0);
-        if stake <= 0 {
+        if stake < MIN_JUROR_STAKE {
             return Err(TrustFlowError::InsufficientStake);
         }
 
@@ -322,10 +344,14 @@ impl TrustFlow {
             .persistent()
             .get(&DataKey::DisputeVoters(escrow_id))
             .unwrap_or_else(|| vec![&env]);
-        voters.push_back(juror);
+        voters.push_back(juror.clone());
         env.storage()
             .persistent()
             .set(&DataKey::DisputeVoters(escrow_id), &voters);
+        env.events().publish(
+            (symbol_short!("vote"), escrow_id),
+            (juror, vote_for_depositor),
+        );
 
         Ok(())
     }
@@ -576,6 +602,28 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn test_juror_eligibility_requires_minimum_stake() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let juror = Address::random(&env);
+
+        assert_eq!(client.get_min_juror_stake(), 100);
+        assert!(!client.is_juror_eligible(&juror));
+
+        mint(&sac, &juror, 99);
+        client.stake(&juror, &99);
+        assert_eq!(client.get_stake(&juror), 99);
+        assert!(!client.is_juror_eligible(&juror));
+
+        mint(&sac, &juror, 1);
+        client.stake(&juror, &1);
+        assert_eq!(client.get_stake(&juror), 100);
+        assert!(client.is_juror_eligible(&juror));
+    }
+
     // -----------------------------------------------------------------------
     // Dispute voting
     // -----------------------------------------------------------------------
@@ -596,6 +644,30 @@ mod tests {
 
         let result = client.try_cast_vote(&escrow_id, &juror, &true);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cast_vote_requires_minimum_juror_stake() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        let juror = Address::random(&env);
+
+        mint(&sac, &depositor, 500);
+        mint(&sac, &juror, 100);
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &500);
+        client.raise_dispute(&escrow_id, &depositor, &String::from_slice(&env, "test"));
+
+        client.stake(&juror, &99);
+        let result = client.try_cast_vote(&escrow_id, &juror, &true);
+        assert!(result.is_err());
+
+        client.stake(&juror, &1);
+        client.cast_vote(&escrow_id, &juror, &true);
     }
 
     #[test]
@@ -780,7 +852,7 @@ mod tests {
         // remaining stake approximates 10_000 * 0.9^3 = 7_290.
         // Due to integer truncation the result is >= 7_290 and < 7_300.
         assert!(
-            stake_r3 >= 7_290 && stake_r3 <= 7_300,
+            (7_290..=7_300).contains(&stake_r3),
             "expected ~7290 after 3×10% slashes, got {stake_r3}"
         );
     }
