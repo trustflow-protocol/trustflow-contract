@@ -1,4 +1,4 @@
-rname: Rust CI Tests
+name: Rust CI Tests
 
 on:
   pull_request:
