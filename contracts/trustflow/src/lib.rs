@@ -1,7 +1,8 @@
 #![cfg_attr(not(test), no_std)]
 
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, symbol_short, token, Address, Env, String, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, String,
+    Vec,
 };
 
 /// Slash rate in basis points applied to minority voters (10% = 1000 bps)
@@ -31,7 +32,6 @@ pub enum TrustFlowError {
 // Events
 // ---------------------------------------------------------------------------
 
-#[contractevent]
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct EscrowInitialized {
