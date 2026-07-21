@@ -108,6 +108,14 @@ Protocol parameters (fees, quorum thresholds, juror rewards) are controlled by o
 
 Price feeds are anchored via the oracle contract, enabling USDC-denominated payouts at fair market rates.
 
+### State Archival & TTL Bump Strategy
+
+Soroban archives `persistent` and `instance` storage entries once their time-to-live (TTL) expires; an archived entry can only be read again after a separate `RestoreFootprintOp`. Because TrustFlow escrows and disputes are often long-lived (milestone projects, jurors slow to vote), the `trustflow` contract (`contracts/trustflow/src/lib.rs`) manages this explicitly instead of relying on the SDK's short default TTL:
+
+- Every persistent write (escrow, dispute, votes, juror stake) is immediately followed by a TTL bump to a 90-day horizon, refreshed once the entry drops under 30 days remaining.
+- The contract **instance** (admin/token/config) is bumped on the same 90-day/30-day schedule on every call. This is intentional: the instance must outlive any single escrow's dormancy window, since a call is needed just to invoke anything — including the maintenance calls below — and an archived instance bricks the whole contract, not just one escrow.
+- `bump_escrow_ttl(escrow_id)` and `bump_juror_stake_ttl(juror)` are permissionless maintenance entrypoints a keeper/cron job can call periodically to keep a fully dormant escrow or an idle juror's stake alive without mutating any state. Both emit events (`EscrowTtlBumped`) for indexers to track rent health.
+
 ---
 
 ## 🛡️ Security

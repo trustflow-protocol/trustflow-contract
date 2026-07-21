@@ -59,3 +59,7 @@ jobs:
       - name: Check all workspace packages compile
         run: cargo check --workspace
         working-directory: contracts
+
+      - name: Run trustflow unit tests
+        run: cargo test --package trustflow
+        working-directory: contracts
