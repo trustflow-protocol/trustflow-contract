@@ -118,6 +118,19 @@ Soroban archives `persistent` and `instance` storage entries once their time-to-
 
 ---
 
+### Atomic Partial-Milestone Release with Fee Split to Treasury
+
+`release_milestone_tranche(escrow_id, milestone_index, gross_amount, caller)` (in `contracts/trustflow/src/lib.rs`) lets a depositor release a milestone's funded amount in one or more partial tranches, splitting a protocol fee to the treasury atomically in the same call:
+
+- **Default fee & treasury**: `initialize` sets a default protocol fee of **50 bps (0.50%)**, paid to the **admin** address, without changing the existing `initialize(admin, token, slash_bps)` signature. The admin can raise or lower the global default fee (up to a **1,000 bps / 10% cap**) via `set_fee_bps`, and repoint the global default treasury via `set_treasury` — both require the stored admin's authorization. `get_fee_bps`/`get_treasury` expose the current global defaults; there are no getters for per-escrow or per-milestone accounting, which is internal contract state.
+- **Per-escrow fee snapshot**: `create_escrow` and `init_escrow` both snapshot the current global fee bps and treasury address onto the escrow at creation time. Later `set_fee_bps`/`set_treasury` calls only affect escrows created afterward — an escrow's fee terms never change mid-flight.
+- **Cumulative fee-delta rounding**: each tranche's fee is charged as `cumulative_fee(released_after) - cumulative_fee(released_before)`, where `cumulative_fee(x) = floor(x * fee_bps / 10_000)` is computed with checked, overflow-safe quotient/remainder arithmetic. This guarantees splitting one release into many tranches never changes the total fee collected, and every tranche satisfies `gross_amount = beneficiary_payout + treasury_fee` exactly.
+- **Atomic two-recipient settlement**: cumulative-release accounting is validated and persisted *before* any token transfer; the beneficiary payout and treasury fee are then both transferred in the same invocation, and a zero-valued fee is simply skipped. If either transfer fails, Soroban rolls back the entire call, so books can never end up mismatched. A milestone's `approved` flag is set on every authorized release, and the escrow is marked `Settled` only once its full funded amount has been released. `resolve_dispute` transfers only the amount still locked, using checked subtraction (unaffected when no partial release occurred).
+- **Event**: each release emits `MilestoneTrancheReleased`, with `escrow_id`/`milestone_index` carried as indexed topics (not duplicated in the event data) so indexers can filter without decoding every event.
+- **No new dependencies**: the feature is implemented entirely with the existing `soroban-sdk` primitives already used elsewhere in the contract (persistent storage, checked `i128` arithmetic, events) — no new crates were added.
+
+---
+
 ## 🛡️ Security
 
 - Overflow checks enabled in all release builds.

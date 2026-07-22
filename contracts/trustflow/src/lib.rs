@@ -8,6 +8,19 @@ use soroban_sdk::{
 /// Slash rate in basis points applied to minority voters (10% = 1000 bps)
 const DEFAULT_SLASH_BPS: u32 = 1_000;
 
+/// Default protocol fee charged on milestone tranche releases, in basis
+/// points (50 = 0.50%). Snapshotted onto each escrow at creation time (see
+/// [`EscrowFeeConfig`]) unless the admin has since changed the global
+/// default via [`TrustFlow::set_fee_bps`].
+const DEFAULT_FEE_BPS: u32 = 50;
+
+/// Upper bound the admin may configure the global protocol fee to via
+/// [`TrustFlow::set_fee_bps`] (1_000 bps = 10%).
+const MAX_FEE_BPS: u32 = 1_000;
+
+/// Denominator basis points are expressed against (10_000 bps = 100%).
+const BPS_DENOMINATOR: i128 = 10_000;
+
 // ---------------------------------------------------------------------------
 // State archival / TTL bump strategy
 // ---------------------------------------------------------------------------
@@ -74,6 +87,78 @@ where
     }
 }
 
+/// Computes `floor(amount * fee_bps / 10_000)` without ever forming the
+/// (potentially overflowing) product `amount * fee_bps` directly.
+///
+/// `amount` is decomposed as `quotient * 10_000 + remainder` (via integer
+/// div/mod), so `amount * fee_bps / 10_000 == quotient * fee_bps +
+/// remainder * fee_bps / 10_000`, and `remainder < 10_000` keeps the second
+/// multiplication small regardless of how large `amount` is. Every step is
+/// checked so an impossible overflow is reported as an error rather than
+/// silently wrapping.
+///
+/// Used to charge each milestone tranche exactly
+/// `cumulative_fee(released_after) - cumulative_fee(released_before)`, which
+/// guarantees fragmenting one release into many never changes the total fee
+/// collected.
+fn cumulative_fee(amount: i128, fee_bps: u32) -> Result<i128, TrustFlowError> {
+    if amount == 0 {
+        return Ok(0);
+    }
+    let fee_bps = fee_bps as i128;
+    let quotient = amount / BPS_DENOMINATOR;
+    let remainder = amount % BPS_DENOMINATOR;
+
+    let quotient_fee = quotient
+        .checked_mul(fee_bps)
+        .ok_or(TrustFlowError::InvalidAmount)?;
+    let remainder_fee = remainder
+        .checked_mul(fee_bps)
+        .ok_or(TrustFlowError::InvalidAmount)?
+        / BPS_DENOMINATOR;
+
+    quotient_fee
+        .checked_add(remainder_fee)
+        .ok_or(TrustFlowError::InvalidAmount)
+}
+
+/// Snapshots the current global `FeeBps`/`Treasury` defaults onto a
+/// newly-created escrow. Called once, right after the escrow record itself
+/// is persisted, from both `create_escrow` and `init_escrow`. Once written
+/// this snapshot is never mutated by later `set_fee_bps` calls.
+fn snapshot_fee_config(env: &Env, escrow_id: u64) {
+    let fee_bps: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::FeeBps)
+        .unwrap_or(DEFAULT_FEE_BPS);
+    let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
+
+    let fee_config_key = DataKey::EscrowFeeConfig(escrow_id);
+    env.storage()
+        .persistent()
+        .set(&fee_config_key, &EscrowFeeConfig { treasury, fee_bps });
+    extend_persistent_ttl(env, &fee_config_key);
+}
+
+fn try_token_transfer(
+    env: &Env,
+    token_address: &Address,
+    from: &Address,
+    to: &Address,
+    amount: i128,
+) -> Result<(), TrustFlowError> {
+    if amount == 0 {
+        return Ok(());
+    }
+
+    let token_client = token::Client::new(env, token_address);
+    match token_client.try_transfer(from, to, &amount) {
+        Ok(Ok(())) => Ok(()),
+        _ => Err(TrustFlowError::TokenTransferFailed),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -93,6 +178,10 @@ pub enum TrustFlowError {
     NoVotesCast = 9,
     MilestoneAmountMismatch = 10,
     JurorStakeNotFound = 11,
+    MilestoneNotFound = 12,
+    InvalidFeeBps = 13,
+    ArithmeticOverflow = 14,
+    TokenTransferFailed = 15,
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +218,21 @@ pub struct JurorStakeTtlBumped {
     pub live_until_ledger: u32,
 }
 
+/// Emitted by [`TrustFlow::release_milestone_tranche`]. `escrow_id` and
+/// `milestone_index` are carried as indexed topics (not duplicated in the
+/// data payload) so indexers can filter without decoding every event.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct MilestoneTrancheReleased {
+    pub gross_amount: i128,
+    pub treasury_fee: i128,
+    pub beneficiary_payout: i128,
+    pub milestone_released: i128,
+    pub escrow_released: i128,
+    pub beneficiary: Address,
+    pub treasury: Address,
+}
+
 // ---------------------------------------------------------------------------
 // Storage types
 // ---------------------------------------------------------------------------
@@ -143,6 +247,17 @@ pub struct VoteKey {
     pub juror: Address,
 }
 
+/// Composite key identifying a single milestone within an escrow. A separate
+/// struct is needed (rather than a `(u64, u32)` tuple variant) because
+/// contracttype enums only support single-element tuple variants for storage
+/// keys — mirrors the [`VoteKey`] pattern above.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct MilestoneKey {
+    pub escrow_id: u64,
+    pub milestone_index: u32,
+}
+
 #[contracttype]
 pub enum DataKey {
     /// Contract administrator
@@ -153,8 +268,24 @@ pub enum DataKey {
     SlashBps,
     /// Counter for generating unique escrow IDs
     EscrowCounter,
+    /// Global default protocol fee in basis points, admin-configurable via
+    /// `set_fee_bps`. Snapshotted per-escrow at creation time; changing this
+    /// never affects escrows created before the change.
+    FeeBps,
+    /// Global default treasury address fees are paid to. Snapshotted
+    /// per-escrow at creation time alongside `FeeBps`.
+    Treasury,
     /// EscrowRecord keyed by escrow ID
     Escrow(u64),
+    /// Snapshotted fee configuration (treasury + fee_bps) for an escrow,
+    /// captured at creation time and immutable thereafter.
+    EscrowFeeConfig(u64),
+    /// Cumulative gross amount released across all milestone tranches for an
+    /// escrow (i128)
+    EscrowReleased(u64),
+    /// Cumulative gross amount released for a single milestone within an
+    /// escrow (i128)
+    MilestoneReleased(MilestoneKey),
     /// DisputeRecord keyed by escrow ID
     Dispute(u64),
     /// Staked token balance for a juror (i128)
@@ -208,6 +339,16 @@ pub struct DisputeRecord {
     pub ruling_for_depositor: bool,
 }
 
+/// Fee configuration snapshotted onto an escrow at creation time. Later
+/// changes to the global `FeeBps`/`Treasury` defaults (via `set_fee_bps`)
+/// never retroactively alter an already-created escrow's snapshot.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowFeeConfig {
+    pub treasury: Address,
+    pub fee_bps: u32,
+}
+
 // ---------------------------------------------------------------------------
 // Contract
 // ---------------------------------------------------------------------------
@@ -221,10 +362,8 @@ impl TrustFlow {
     // Initialisation
     // -----------------------------------------------------------------------
 
-    /// Initialise the contract.  Must be called once before any other function.
-    ///
-    /// * `slash_bps` – basis points deducted from a minority voter's stake
-    ///   each time they are slashed (e.g. `1000` = 10 %).
+    /// Initialise the contract. Must be called once before any other function.
+    /// `slash_bps` are deducted from a minority voter's stake on each slash.
     pub fn initialize(env: Env, admin: Address, token: Address, slash_bps: u32) {
         admin.require_auth();
         if slash_bps > 10_000 {
@@ -234,7 +373,59 @@ impl TrustFlow {
         env.storage().instance().set(&DataKey::Token, &token);
         env.storage().instance().set(&DataKey::SlashBps, &slash_bps);
         env.storage().instance().set(&DataKey::EscrowCounter, &0u64);
+        // Default protocol fee is 50 bps, paid to the admin's address until
+        // `set_treasury` is used to point it elsewhere.
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeBps, &DEFAULT_FEE_BPS);
+        env.storage().instance().set(&DataKey::Treasury, &admin);
         extend_instance_ttl(&env);
+    }
+
+    /// Admin-only: update the global default protocol fee (bps) used to
+    /// snapshot new escrows. Does not affect already-created escrows.
+    pub fn set_fee_bps(env: Env, caller: Address, fee_bps: u32) -> Result<(), TrustFlowError> {
+        caller.require_auth();
+        extend_instance_ttl(&env);
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != admin {
+            return Err(TrustFlowError::Unauthorized);
+        }
+        if fee_bps > MAX_FEE_BPS {
+            return Err(TrustFlowError::InvalidFeeBps);
+        }
+        env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
+        Ok(())
+    }
+
+    /// Return the current global default protocol fee, in basis points.
+    pub fn get_fee_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::FeeBps)
+            .unwrap_or(DEFAULT_FEE_BPS)
+    }
+
+    /// Return the current global default treasury address.
+    pub fn get_treasury(env: Env) -> Address {
+        env.storage().instance().get(&DataKey::Treasury).unwrap()
+    }
+
+    /// Admin-only: update the global default treasury address used to
+    /// snapshot new escrows. Does not affect already-created escrows.
+    pub fn set_treasury(
+        env: Env,
+        caller: Address,
+        treasury: Address,
+    ) -> Result<(), TrustFlowError> {
+        caller.require_auth();
+        extend_instance_ttl(&env);
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != admin {
+            return Err(TrustFlowError::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::Treasury, &treasury);
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -291,20 +482,13 @@ impl TrustFlow {
     }
 
     /// Extend the TTL of a juror's stake/slash-count storage. Callable by
-    /// anyone, since it only pays for rent and cannot move funds.
-    ///
-    /// A juror may stay staked for a long time between disputes; without
-    /// periodic maintenance their stake entry could archive and, on the
-    /// next dispute they are drawn into, `resolve_dispute` would be unable
-    /// to read or slash it — bricking settlement for whichever escrow's
-    /// dispute is waiting on that resolution.
-    ///
-    /// Returns the ledger sequence up to which the stake is now guaranteed
-    /// to live. Errors (no state change, no event) if the juror has no
-    /// stake on record — mirrors `bump_escrow_ttl`'s error-on-nonexistent
-    /// behavior rather than silently no-op'ing, so a bump always means
-    /// "there was live state and its TTL was refreshed."
+    /// anyone. Errors if the juror has no stake on record.
     pub fn bump_juror_stake_ttl(env: Env, juror: Address) -> Result<u32, TrustFlowError> {
+        // A juror may stay staked for a long time between disputes; without
+        // periodic maintenance their stake entry could archive and, on the
+        // next dispute they are drawn into, `resolve_dispute` would be
+        // unable to read or slash it. Returns the ledger sequence up to
+        // which the stake is now guaranteed to live.
         let stake_key = DataKey::JurorStake(juror.clone());
         if !env.storage().persistent().has(&stake_key) {
             return Err(TrustFlowError::JurorStakeNotFound);
@@ -374,6 +558,7 @@ impl TrustFlow {
             },
         );
         extend_persistent_ttl(&env, &escrow_key);
+        snapshot_fee_config(&env, id);
         Ok(id)
     }
 
@@ -427,6 +612,7 @@ impl TrustFlow {
             },
         );
         extend_persistent_ttl(&env, &escrow_key);
+        snapshot_fee_config(&env, id);
 
         env.events().publish(
             (symbol_short!("escrow"), symbol_short!("init")),
@@ -439,6 +625,151 @@ impl TrustFlow {
         );
 
         Ok(id)
+    }
+
+    /// Release a `gross_amount` tranche of a milestone to its beneficiary,
+    /// splitting the escrow's snapshotted fee to its snapshotted treasury
+    /// atomically. Caller must be the depositor. May be called repeatedly
+    /// per milestone; settles the escrow once fully released.
+    pub fn release_milestone_tranche(
+        env: Env,
+        escrow_id: u64,
+        milestone_index: u32,
+        gross_amount: i128,
+        caller: Address,
+    ) -> Result<(), TrustFlowError> {
+        // Each tranche is charged exactly
+        // cumulative_fee(escrow_released_after) - cumulative_fee(escrow_released_before),
+        // which guarantees splitting one release into many tranches never
+        // changes the total fee collected across the whole escrow (see
+        // `cumulative_fee`). All validation and storage accounting happens
+        // before either token transfer, and both transfers happen in this
+        // same invocation -- if either fails, Soroban rolls back the whole
+        // call, so there is no way to end up with mismatched books.
+        caller.require_auth();
+        extend_instance_ttl(&env);
+
+        if gross_amount <= 0 {
+            return Err(TrustFlowError::InvalidAmount);
+        }
+
+        let escrow_key = DataKey::Escrow(escrow_id);
+        let mut escrow: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&escrow_key)
+            .ok_or(TrustFlowError::EscrowNotFound)?;
+
+        if caller != escrow.depositor {
+            return Err(TrustFlowError::Unauthorized);
+        }
+        if escrow.status != EscrowStatus::Active {
+            return Err(TrustFlowError::InvalidState);
+        }
+
+        let mut milestone = escrow
+            .milestones
+            .get(milestone_index)
+            .ok_or(TrustFlowError::MilestoneNotFound)?;
+
+        let milestone_key = DataKey::MilestoneReleased(MilestoneKey {
+            escrow_id,
+            milestone_index,
+        });
+        let milestone_released_before: i128 =
+            env.storage().persistent().get(&milestone_key).unwrap_or(0);
+        let milestone_released_after = milestone_released_before
+            .checked_add(gross_amount)
+            .ok_or(TrustFlowError::InvalidAmount)?;
+        if milestone_released_after > milestone.amount {
+            return Err(TrustFlowError::MilestoneAmountMismatch);
+        }
+
+        let released_key = DataKey::EscrowReleased(escrow_id);
+        let escrow_released_before: i128 =
+            env.storage().persistent().get(&released_key).unwrap_or(0);
+        let escrow_released_after = escrow_released_before
+            .checked_add(gross_amount)
+            .ok_or(TrustFlowError::InvalidAmount)?;
+        if escrow_released_after > escrow.amount {
+            return Err(TrustFlowError::MilestoneAmountMismatch);
+        }
+
+        let fee_config_key = DataKey::EscrowFeeConfig(escrow_id);
+        let fee_config: EscrowFeeConfig = env
+            .storage()
+            .persistent()
+            .get(&fee_config_key)
+            .ok_or(TrustFlowError::EscrowNotFound)?;
+        extend_persistent_ttl(&env, &fee_config_key);
+
+        let fee_before = cumulative_fee(escrow_released_before, fee_config.fee_bps)?;
+        let fee_after = cumulative_fee(escrow_released_after, fee_config.fee_bps)?;
+        let treasury_fee = fee_after
+            .checked_sub(fee_before)
+            .ok_or(TrustFlowError::InvalidAmount)?;
+        let beneficiary_payout = gross_amount
+            .checked_sub(treasury_fee)
+            .ok_or(TrustFlowError::InvalidAmount)?;
+
+        // -- All validation done; persist accounting before any transfer. --
+
+        milestone.approved = true;
+        escrow.milestones.set(milestone_index, milestone);
+        if escrow_released_after == escrow.amount {
+            escrow.status = EscrowStatus::Settled;
+        }
+        env.storage().persistent().set(&escrow_key, &escrow);
+        extend_persistent_ttl(&env, &escrow_key);
+
+        env.storage()
+            .persistent()
+            .set(&milestone_key, &milestone_released_after);
+        extend_persistent_ttl(&env, &milestone_key);
+
+        env.storage()
+            .persistent()
+            .set(&released_key, &escrow_released_after);
+        extend_persistent_ttl(&env, &released_key);
+
+        // -- Accounting is durable; now move the tokens. --
+
+        let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        let contract_address = env.current_contract_address();
+        try_token_transfer(
+            &env,
+            &token,
+            &contract_address,
+            &escrow.beneficiary,
+            beneficiary_payout,
+        )?;
+        try_token_transfer(
+            &env,
+            &token,
+            &contract_address,
+            &fee_config.treasury,
+            treasury_fee,
+        )?;
+
+        env.events().publish(
+            (
+                symbol_short!("mstone"),
+                symbol_short!("release"),
+                escrow_id,
+                milestone_index,
+            ),
+            MilestoneTrancheReleased {
+                gross_amount,
+                treasury_fee,
+                beneficiary_payout,
+                milestone_released: milestone_released_after,
+                escrow_released: escrow_released_after,
+                beneficiary: escrow.beneficiary,
+                treasury: fee_config.treasury,
+            },
+        );
+
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -472,6 +803,10 @@ impl TrustFlow {
         escrow.status = EscrowStatus::Disputed;
         env.storage().persistent().set(&escrow_key, &escrow);
         extend_persistent_ttl(&env, &escrow_key);
+
+        // Dispute settlement depends on the cumulative released amount.
+        // Keep it alive whenever the escrow is refreshed on dispute entry.
+        extend_persistent_ttl(&env, &DataKey::EscrowReleased(escrow_id));
 
         let dispute_key = DataKey::Dispute(escrow_id);
         env.storage().persistent().set(
@@ -648,7 +983,12 @@ impl TrustFlow {
         env.storage().persistent().set(&dispute_key, &dispute);
         extend_persistent_ttl(&env, &dispute_key);
 
-        // Settle escrow funds
+        // Settle escrow funds. Any milestone tranches already released via
+        // `release_milestone_tranche` before the dispute was raised have
+        // already left the contract, so only the amount still locked
+        // (escrow.amount - cumulative released) is transferred here. When no
+        // partial release has occurred `released` is 0 and this transfers
+        // the full `escrow.amount`, matching prior behavior exactly.
         let escrow_key = DataKey::Escrow(escrow_id);
         let mut escrow: EscrowRecord = env
             .storage()
@@ -658,12 +998,24 @@ impl TrustFlow {
         let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         let token_client = token::Client::new(&env, &token);
 
+        let released: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowReleased(escrow_id))
+            .unwrap_or(0);
+        let remaining = escrow
+            .amount
+            .checked_sub(released)
+            .ok_or(TrustFlowError::ArithmeticOverflow)?;
+
         let recipient = if ruling {
             escrow.depositor.clone()
         } else {
             escrow.beneficiary.clone()
         };
-        token_client.transfer(&env.current_contract_address(), &recipient, &escrow.amount);
+        if remaining > 0 {
+            token_client.transfer(&env.current_contract_address(), &recipient, &remaining);
+        }
 
         escrow.status = EscrowStatus::Settled;
         env.storage().persistent().set(&escrow_key, &escrow);
@@ -685,12 +1037,30 @@ impl TrustFlow {
     /// guaranteed to live.
     pub fn bump_escrow_ttl(env: Env, escrow_id: u64) -> Result<u32, TrustFlowError> {
         let escrow_key = DataKey::Escrow(escrow_id);
-        if !env.storage().persistent().has(&escrow_key) {
-            return Err(TrustFlowError::EscrowNotFound);
-        }
+        let escrow: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&escrow_key)
+            .ok_or(TrustFlowError::EscrowNotFound)?;
 
         extend_instance_ttl(&env);
         extend_persistent_ttl(&env, &escrow_key);
+
+        // Milestone-release accounting introduced alongside partial
+        // settlement: the fee snapshot, the escrow-wide released counter,
+        // and each milestone's own released counter all need to survive as
+        // long as the escrow itself does.
+        extend_persistent_ttl(&env, &DataKey::EscrowFeeConfig(escrow_id));
+        extend_persistent_ttl(&env, &DataKey::EscrowReleased(escrow_id));
+        for (index, _) in escrow.milestones.iter().enumerate() {
+            extend_persistent_ttl(
+                &env,
+                &DataKey::MilestoneReleased(MilestoneKey {
+                    escrow_id,
+                    milestone_index: index as u32,
+                }),
+            );
+        }
 
         let dispute_key = DataKey::Dispute(escrow_id);
         if env.storage().persistent().has(&dispute_key) {
@@ -760,6 +1130,56 @@ mod tests {
         token::Client::new(env, token_addr).balance(addr)
     }
 
+    // The four helpers below read contract storage directly (via
+    // `env.as_contract`) rather than through public getters — the contract
+    // intentionally exposes no `get_escrow`/`get_escrow_fee_config`/
+    // `get_milestone_released`/`get_escrow_released` entrypoints, to keep
+    // its public ABI (and on-chain spec) minimal.
+
+    fn read_escrow(env: &Env, contract_id: &Address, escrow_id: u64) -> EscrowRecord {
+        env.as_contract(contract_id, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::Escrow(escrow_id))
+                .unwrap()
+        })
+    }
+
+    fn read_escrow_fee_config(env: &Env, contract_id: &Address, escrow_id: u64) -> EscrowFeeConfig {
+        env.as_contract(contract_id, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::EscrowFeeConfig(escrow_id))
+                .unwrap()
+        })
+    }
+
+    fn read_milestone_released(
+        env: &Env,
+        contract_id: &Address,
+        escrow_id: u64,
+        milestone_index: u32,
+    ) -> i128 {
+        env.as_contract(contract_id, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::MilestoneReleased(MilestoneKey {
+                    escrow_id,
+                    milestone_index,
+                }))
+                .unwrap_or(0)
+        })
+    }
+
+    fn read_escrow_released(env: &Env, contract_id: &Address, escrow_id: u64) -> i128 {
+        env.as_contract(contract_id, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::EscrowReleased(escrow_id))
+                .unwrap_or(0)
+        })
+    }
+
     fn dispute_round(
         env: &Env,
         client: &TrustFlowClient,
@@ -825,7 +1245,7 @@ mod tests {
         client.stake(&juror, &100);
 
         let result = client.try_unstake(&juror, &200);
-        assert!(result.is_err());
+        assert_eq!(result, Err(Ok(TrustFlowError::InsufficientStake)));
     }
 
     #[test]
@@ -837,7 +1257,7 @@ mod tests {
         let juror = Address::random(&env);
 
         let result = client.try_stake(&juror, &0);
-        assert!(result.is_err());
+        assert_eq!(result, Err(Ok(TrustFlowError::InvalidAmount)));
     }
 
     // -----------------------------------------------------------------------
@@ -859,7 +1279,7 @@ mod tests {
         client.raise_dispute(&escrow_id, &depositor, &String::from_slice(&env, "test"));
 
         let result = client.try_cast_vote(&escrow_id, &juror, &true);
-        assert!(result.is_err());
+        assert_eq!(result, Err(Ok(TrustFlowError::InsufficientStake)));
     }
 
     #[test]
@@ -881,7 +1301,7 @@ mod tests {
         client.cast_vote(&escrow_id, &juror, &true);
 
         let result = client.try_cast_vote(&escrow_id, &juror, &true);
-        assert!(result.is_err());
+        assert_eq!(result, Err(Ok(TrustFlowError::AlreadyVoted)));
     }
 
     // -----------------------------------------------------------------------
@@ -1160,7 +1580,7 @@ mod tests {
         client.raise_dispute(&escrow_id, &depositor, &String::from_slice(&env, "test"));
 
         let result = client.try_resolve_dispute(&escrow_id);
-        assert!(result.is_err());
+        assert_eq!(result, Err(Ok(TrustFlowError::NoVotesCast)));
     }
 
     #[test]
@@ -1183,7 +1603,7 @@ mod tests {
         client.resolve_dispute(&escrow_id);
 
         let result = client.try_resolve_dispute(&escrow_id);
-        assert!(result.is_err());
+        assert_eq!(result, Err(Ok(TrustFlowError::DisputeAlreadyResolved)));
     }
 
     #[test]
@@ -1373,7 +1793,7 @@ mod tests {
         let (client, _token_addr, _sac) = setup(&env, DEFAULT_SLASH_BPS);
 
         let result = client.try_bump_escrow_ttl(&999);
-        assert!(result.is_err());
+        assert_eq!(result, Err(Ok(TrustFlowError::EscrowNotFound)));
     }
 
     #[test]
@@ -1458,7 +1878,7 @@ mod tests {
         let juror = Address::random(&env);
 
         let result = client.try_bump_juror_stake_ttl(&juror);
-        assert!(result.is_err());
+        assert_eq!(result, Err(Ok(TrustFlowError::JurorStakeNotFound)));
     }
 
     #[test]
@@ -1513,5 +1933,619 @@ mod tests {
         mint(&sac, &juror, 100);
         client.stake(&juror, &100);
         assert_eq!(client.get_stake(&juror), 100);
+    }
+
+    // -----------------------------------------------------------------------
+    // Atomic partial-milestone release with fee split to treasury
+    // -----------------------------------------------------------------------
+
+    /// Creates a single-milestone escrow of `milestone_amount` and returns
+    /// `(depositor, beneficiary, escrow_id)`.
+    fn setup_milestone_escrow(
+        env: &Env,
+        client: &TrustFlowClient,
+        sac: &token::StellarAssetClient,
+        milestone_amount: i128,
+    ) -> (Address, Address, u64) {
+        let depositor = Address::random(env);
+        let beneficiary = Address::random(env);
+        mint(sac, &depositor, milestone_amount);
+
+        let milestones = Vec::from_array(
+            env,
+            [Milestone {
+                label: String::from_slice(env, "Milestone 1"),
+                amount: milestone_amount,
+                approved: false,
+            }],
+        );
+        let escrow_id = client.init_escrow(&depositor, &beneficiary, &milestones);
+        (depositor, beneficiary, escrow_id)
+    }
+
+    #[test]
+    fn test_release_milestone_exact_fee_split() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let (depositor, beneficiary, escrow_id) =
+            setup_milestone_escrow(&env, &client, &sac, 10_000);
+        let treasury = client.get_treasury();
+
+        client.release_milestone_tranche(&escrow_id, &0u32, &10_000, &depositor);
+
+        // Default fee is 50 bps (0.50%): floor(10_000 * 50 / 10_000) = 50.
+        assert_eq!(balance(&env, &token_addr, &beneficiary), 9_950);
+        assert_eq!(balance(&env, &token_addr, &treasury), 50);
+        assert_eq!(balance(&env, &token_addr, &client.address), 0);
+
+        let escrow = read_escrow(&env, &client.address, escrow_id);
+        assert_eq!(escrow.status, EscrowStatus::Settled);
+        assert!(escrow.milestones.get(0).unwrap().approved);
+    }
+
+    #[test]
+    fn test_release_milestone_rounding_zero_fee_tranche() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let (depositor, beneficiary, escrow_id) =
+            setup_milestone_escrow(&env, &client, &sac, 1_000);
+        let treasury = client.get_treasury();
+
+        // floor(100 * 50 / 10_000) = floor(0.5) = 0: the tranche fee rounds
+        // down to zero and the full tranche goes to the beneficiary.
+        client.release_milestone_tranche(&escrow_id, &0u32, &100, &depositor);
+
+        assert_eq!(balance(&env, &token_addr, &beneficiary), 100);
+        assert_eq!(balance(&env, &token_addr, &treasury), 0);
+        assert_eq!(
+            read_milestone_released(&env, &client.address, escrow_id, 0u32),
+            100
+        );
+    }
+
+    #[test]
+    fn test_fragmented_releases_charge_same_total_fee_as_single_release() {
+        let total_gross: i128 = 333;
+        let expected_total_fee = (total_gross * DEFAULT_FEE_BPS as i128) / BPS_DENOMINATOR;
+
+        // Fragmented scenario: the same total gross amount released across
+        // three tranches, in its own Env so nothing else can contaminate the
+        // treasury balance being measured.
+        let env_fragmented = Env::default();
+        env_fragmented.mock_all_auths();
+        let (client_f, token_addr_f, sac_f) = setup(&env_fragmented, DEFAULT_SLASH_BPS);
+        let treasury_f = client_f.get_treasury();
+        let (depositor_f, beneficiary_f, escrow_f) =
+            setup_milestone_escrow(&env_fragmented, &client_f, &sac_f, total_gross);
+
+        let treasury_before_fragmented = balance(&env_fragmented, &token_addr_f, &treasury_f);
+        let beneficiary_before_fragmented = balance(&env_fragmented, &token_addr_f, &beneficiary_f);
+        client_f.release_milestone_tranche(&escrow_f, &0u32, &111, &depositor_f);
+        client_f.release_milestone_tranche(&escrow_f, &0u32, &111, &depositor_f);
+        client_f.release_milestone_tranche(&escrow_f, &0u32, &111, &depositor_f);
+        let fragmented_total_fee =
+            balance(&env_fragmented, &token_addr_f, &treasury_f) - treasury_before_fragmented;
+        let fragmented_total_payout =
+            balance(&env_fragmented, &token_addr_f, &beneficiary_f) - beneficiary_before_fragmented;
+
+        // One-shot scenario: same total gross amount released in a single
+        // call, in a fully independent Env so balances, escrow IDs, events,
+        // and treasury state cannot contaminate the fragmented scenario
+        // above.
+        let env_one_shot = Env::default();
+        env_one_shot.mock_all_auths();
+        let (client_o, token_addr_o, sac_o) = setup(&env_one_shot, DEFAULT_SLASH_BPS);
+        let treasury_o = client_o.get_treasury();
+        let (depositor_o, _beneficiary_o, escrow_o) =
+            setup_milestone_escrow(&env_one_shot, &client_o, &sac_o, total_gross);
+
+        let treasury_before_one_shot = balance(&env_one_shot, &token_addr_o, &treasury_o);
+        client_o.release_milestone_tranche(&escrow_o, &0u32, &total_gross, &depositor_o);
+        let one_shot_total_fee =
+            balance(&env_one_shot, &token_addr_o, &treasury_o) - treasury_before_one_shot;
+
+        assert_eq!(fragmented_total_fee, one_shot_total_fee);
+        assert_eq!(fragmented_total_fee, expected_total_fee);
+        assert_eq!(one_shot_total_fee, expected_total_fee);
+        assert_eq!(fragmented_total_payout + fragmented_total_fee, total_gross);
+    }
+
+    #[test]
+    fn test_multiple_partial_releases_accumulate() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let (depositor, _beneficiary, escrow_id) =
+            setup_milestone_escrow(&env, &client, &sac, 1_000);
+
+        client.release_milestone_tranche(&escrow_id, &0u32, &400, &depositor);
+        assert_eq!(
+            read_milestone_released(&env, &client.address, escrow_id, 0u32),
+            400
+        );
+        assert_eq!(read_escrow_released(&env, &client.address, escrow_id), 400);
+        assert_eq!(
+            read_escrow(&env, &client.address, escrow_id).status,
+            EscrowStatus::Active
+        );
+
+        client.release_milestone_tranche(&escrow_id, &0u32, &300, &depositor);
+        assert_eq!(
+            read_milestone_released(&env, &client.address, escrow_id, 0u32),
+            700
+        );
+        assert_eq!(read_escrow_released(&env, &client.address, escrow_id), 700);
+        assert_eq!(
+            read_escrow(&env, &client.address, escrow_id).status,
+            EscrowStatus::Active
+        );
+    }
+
+    #[test]
+    fn test_final_release_settles_escrow() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        mint(&sac, &depositor, 1_000);
+
+        let milestones = Vec::from_array(
+            &env,
+            [
+                Milestone {
+                    label: String::from_slice(&env, "M1"),
+                    amount: 400,
+                    approved: false,
+                },
+                Milestone {
+                    label: String::from_slice(&env, "M2"),
+                    amount: 600,
+                    approved: false,
+                },
+            ],
+        );
+        let escrow_id = client.init_escrow(&depositor, &beneficiary, &milestones);
+
+        client.release_milestone_tranche(&escrow_id, &0u32, &400, &depositor);
+        assert_eq!(
+            read_escrow(&env, &client.address, escrow_id).status,
+            EscrowStatus::Active
+        );
+
+        client.release_milestone_tranche(&escrow_id, &1u32, &600, &depositor);
+        let escrow = read_escrow(&env, &client.address, escrow_id);
+        assert_eq!(escrow.status, EscrowStatus::Settled);
+        assert!(escrow.milestones.get(0).unwrap().approved);
+        assert!(escrow.milestones.get(1).unwrap().approved);
+    }
+
+    #[test]
+    fn test_release_zero_amount_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let (depositor, _beneficiary, escrow_id) =
+            setup_milestone_escrow(&env, &client, &sac, 1_000);
+
+        let result = client.try_release_milestone_tranche(&escrow_id, &0u32, &0, &depositor);
+        assert_eq!(result, Err(Ok(TrustFlowError::InvalidAmount)));
+    }
+
+    #[test]
+    fn test_release_excessive_amount_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let (depositor, _beneficiary, escrow_id) =
+            setup_milestone_escrow(&env, &client, &sac, 1_000);
+
+        let result = client.try_release_milestone_tranche(&escrow_id, &0u32, &1_001, &depositor);
+        assert_eq!(result, Err(Ok(TrustFlowError::MilestoneAmountMismatch)));
+
+        // A valid partial release followed by an over-release of the
+        // remainder must also fail, and must not mutate any state.
+        client.release_milestone_tranche(&escrow_id, &0u32, &600, &depositor);
+        let result = client.try_release_milestone_tranche(&escrow_id, &0u32, &500, &depositor);
+        assert_eq!(result, Err(Ok(TrustFlowError::MilestoneAmountMismatch)));
+        assert_eq!(
+            read_milestone_released(&env, &client.address, escrow_id, 0u32),
+            600
+        );
+    }
+
+    #[test]
+    fn test_release_nonexistent_milestone_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let (depositor, _beneficiary, escrow_id) =
+            setup_milestone_escrow(&env, &client, &sac, 1_000);
+
+        let result = client.try_release_milestone_tranche(&escrow_id, &5u32, &100, &depositor);
+        assert_eq!(result, Err(Ok(TrustFlowError::MilestoneNotFound)));
+    }
+
+    #[test]
+    fn test_release_unauthorized_caller_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let (_depositor, beneficiary, escrow_id) =
+            setup_milestone_escrow(&env, &client, &sac, 1_000);
+
+        // The beneficiary is not the depositor and must not be able to
+        // authorize a release.
+        let result = client.try_release_milestone_tranche(&escrow_id, &0u32, &500, &beneficiary);
+        assert_eq!(result, Err(Ok(TrustFlowError::Unauthorized)));
+    }
+
+    #[test]
+    fn test_release_on_disputed_escrow_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let (depositor, _beneficiary, escrow_id) =
+            setup_milestone_escrow(&env, &client, &sac, 1_000);
+
+        client.raise_dispute(&escrow_id, &depositor, &String::from_slice(&env, "test"));
+
+        let result = client.try_release_milestone_tranche(&escrow_id, &0u32, &500, &depositor);
+        assert_eq!(result, Err(Ok(TrustFlowError::InvalidState)));
+    }
+
+    #[test]
+    fn test_release_on_settled_escrow_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let (depositor, _beneficiary, escrow_id) =
+            setup_milestone_escrow(&env, &client, &sac, 1_000);
+
+        client.release_milestone_tranche(&escrow_id, &0u32, &1_000, &depositor);
+        assert_eq!(
+            read_escrow(&env, &client.address, escrow_id).status,
+            EscrowStatus::Settled
+        );
+
+        let result = client.try_release_milestone_tranche(&escrow_id, &0u32, &1, &depositor);
+        assert_eq!(result, Err(Ok(TrustFlowError::InvalidState)));
+    }
+
+    #[test]
+    fn test_set_fee_bps_authorization_and_limits() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, _sac) = setup(&env, DEFAULT_SLASH_BPS);
+        // Default treasury is the admin, so this is the real stored admin.
+        let admin = client.get_treasury();
+
+        assert_eq!(client.get_fee_bps(), DEFAULT_FEE_BPS);
+
+        client.set_fee_bps(&admin, &200);
+        assert_eq!(client.get_fee_bps(), 200);
+
+        // Exceeds the 1_000 bps cap.
+        let result = client.try_set_fee_bps(&admin, &1_001);
+        assert_eq!(result, Err(Ok(TrustFlowError::InvalidFeeBps)));
+        assert_eq!(client.get_fee_bps(), 200);
+
+        // A non-admin caller must be rejected even though `mock_all_auths`
+        // makes every `require_auth()` call succeed.
+        let stranger = Address::random(&env);
+        let result = client.try_set_fee_bps(&stranger, &100);
+        assert_eq!(result, Err(Ok(TrustFlowError::Unauthorized)));
+        assert_eq!(client.get_fee_bps(), 200);
+    }
+
+    #[test]
+    fn test_set_treasury_authorization() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, _sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let admin = client.get_treasury();
+        let new_treasury = Address::random(&env);
+
+        // A non-admin caller must be rejected even though `mock_all_auths`
+        // makes every `require_auth()` call succeed.
+        let stranger = Address::random(&env);
+        let result = client.try_set_treasury(&stranger, &new_treasury);
+        assert_eq!(result, Err(Ok(TrustFlowError::Unauthorized)));
+        assert_eq!(client.get_treasury(), admin);
+
+        client.set_treasury(&admin, &new_treasury);
+        assert_eq!(client.get_treasury(), new_treasury);
+    }
+
+    #[test]
+    fn test_escrow_fee_snapshot_immutable_after_fee_change() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let admin = client.get_treasury();
+
+        let (_depositor, _beneficiary, escrow_id) =
+            setup_milestone_escrow(&env, &client, &sac, 1_000);
+        let snapshot_before = read_escrow_fee_config(&env, &client.address, escrow_id);
+        assert_eq!(snapshot_before.fee_bps, DEFAULT_FEE_BPS);
+
+        client.set_fee_bps(&admin, &500);
+
+        let snapshot_after = read_escrow_fee_config(&env, &client.address, escrow_id);
+        assert_eq!(snapshot_after, snapshot_before);
+        assert_eq!(snapshot_after.fee_bps, DEFAULT_FEE_BPS);
+
+        // A new escrow created after the change picks up the new default.
+        let depositor2 = Address::random(&env);
+        let beneficiary2 = Address::random(&env);
+        mint(&sac, &depositor2, 1_000);
+        let escrow_id_2 = client.create_escrow(&depositor2, &beneficiary2, &1_000);
+        let snapshot_2 = read_escrow_fee_config(&env, &client.address, escrow_id_2);
+        assert_eq!(snapshot_2.fee_bps, 500);
+    }
+
+    #[test]
+    fn test_escrow_treasury_snapshot_immutable_after_treasury_change() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let admin = client.get_treasury();
+
+        let (_depositor, _beneficiary, escrow_id) =
+            setup_milestone_escrow(&env, &client, &sac, 1_000);
+        let snapshot_before = read_escrow_fee_config(&env, &client.address, escrow_id);
+        assert_eq!(snapshot_before.treasury, admin);
+
+        let new_treasury = Address::random(&env);
+        client.set_treasury(&admin, &new_treasury);
+
+        let snapshot_after = read_escrow_fee_config(&env, &client.address, escrow_id);
+        assert_eq!(snapshot_after, snapshot_before);
+        assert_eq!(snapshot_after.treasury, admin);
+
+        // A new escrow created after the change picks up the new treasury.
+        let depositor2 = Address::random(&env);
+        let beneficiary2 = Address::random(&env);
+        mint(&sac, &depositor2, 1_000);
+        let escrow_id_2 = client.create_escrow(&depositor2, &beneficiary2, &1_000);
+        let snapshot_2 = read_escrow_fee_config(&env, &client.address, escrow_id_2);
+        assert_eq!(snapshot_2.treasury, new_treasury);
+    }
+
+    #[test]
+    fn test_release_milestone_tranche_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let (depositor, beneficiary, escrow_id) =
+            setup_milestone_escrow(&env, &client, &sac, 10_000);
+        let treasury = client.get_treasury();
+
+        client.release_milestone_tranche(&escrow_id, &0u32, &10_000, &depositor);
+
+        let (event_contract, event_topics, event_data) = env.events().all().last().unwrap();
+        assert_eq!(event_contract, client.address);
+
+        let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> = (
+            symbol_short!("mstone"),
+            symbol_short!("release"),
+            escrow_id,
+            0u32,
+        )
+            .into_val(&env);
+        assert_eq!(event_topics, expected_topics);
+
+        let decoded = MilestoneTrancheReleased::try_from_val(&env, &event_data).unwrap();
+        assert_eq!(decoded.gross_amount, 10_000);
+        assert_eq!(decoded.treasury_fee, 50);
+        assert_eq!(decoded.beneficiary_payout, 9_950);
+        assert_eq!(decoded.milestone_released, 10_000);
+        assert_eq!(decoded.escrow_released, 10_000);
+        assert_eq!(decoded.beneficiary, beneficiary);
+        assert_eq!(decoded.treasury, treasury);
+    }
+
+    #[test]
+    fn test_raise_dispute_refreshes_partial_release_accounting_ttl() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let (depositor, _beneficiary, escrow_id) =
+            setup_milestone_escrow(&env, &client, &sac, 1_000);
+
+        client.release_milestone_tranche(&escrow_id, &0u32, &400, &depositor);
+
+        advance_ledger(
+            &env,
+            PERSISTENT_BUMP_AMOUNT - PERSISTENT_LIFETIME_THRESHOLD + 1,
+        );
+
+        client.raise_dispute(
+            &escrow_id,
+            &depositor,
+            &String::from_slice(&env, "ttl regression"),
+        );
+
+        // Move beyond the original expiration of the release counter.
+        // No token invocation is needed after this point.
+        advance_ledger(&env, PERSISTENT_LIFETIME_THRESHOLD);
+
+        assert_eq!(read_escrow_released(&env, &client.address, escrow_id), 400);
+        assert_eq!(
+            read_escrow(&env, &client.address, escrow_id).status,
+            EscrowStatus::Disputed
+        );
+    }
+    #[test]
+    fn test_dispute_settlement_after_partial_release_transfers_remaining_only() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let (depositor, beneficiary, escrow_id) =
+            setup_milestone_escrow(&env, &client, &sac, 1_000);
+
+        // Partial release before the dispute is raised.
+        client.release_milestone_tranche(&escrow_id, &0u32, &400, &depositor);
+        let beneficiary_balance_after_partial = balance(&env, &token_addr, &beneficiary);
+
+        client.raise_dispute(
+            &escrow_id,
+            &depositor,
+            &String::from_slice(&env, "scope changed"),
+        );
+
+        let juror = Address::random(&env);
+        mint(&sac, &juror, 500);
+        client.stake(&juror, &500);
+        client.cast_vote(&escrow_id, &juror, &false); // rules for beneficiary
+
+        let contract_balance_before = balance(&env, &token_addr, &client.address);
+        client.resolve_dispute(&escrow_id);
+
+        // Only the still-locked 600 (1_000 - 400 already released) may move
+        // — transferring the original full 1_000 here would double-pay the
+        // beneficiary for the 400 already released.
+        assert_eq!(
+            balance(&env, &token_addr, &beneficiary),
+            beneficiary_balance_after_partial + 600
+        );
+        assert_eq!(
+            balance(&env, &token_addr, &client.address),
+            contract_balance_before - 600
+        );
+
+        let escrow = read_escrow(&env, &client.address, escrow_id);
+        assert_eq!(escrow.status, EscrowStatus::Settled);
+    }
+
+    #[test]
+    fn test_no_balance_leakage_matches_gross_release() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let (depositor, _beneficiary, escrow_id) =
+            setup_milestone_escrow(&env, &client, &sac, 10_000);
+
+        let contract_balance_before = balance(&env, &token_addr, &client.address);
+
+        client.release_milestone_tranche(&escrow_id, &0u32, &3_333, &depositor);
+        client.release_milestone_tranche(&escrow_id, &0u32, &3_333, &depositor);
+        client.release_milestone_tranche(&escrow_id, &0u32, &3_334, &depositor);
+
+        let contract_balance_after = balance(&env, &token_addr, &client.address);
+        // The contract's balance must drop by exactly the gross amount
+        // released — no more (leaked) and no less (stuck) than what left as
+        // beneficiary payout + treasury fee.
+        assert_eq!(contract_balance_before - contract_balance_after, 10_000);
+
+        let escrow = read_escrow(&env, &client.address, escrow_id);
+        assert_eq!(escrow.status, EscrowStatus::Settled);
+    }
+
+    // -----------------------------------------------------------------------
+    // Atomic rollback on transfer failure
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_release_milestone_tranche_rolls_back_atomically_on_transfer_failure() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let (depositor, beneficiary, escrow_id) =
+            setup_milestone_escrow(&env, &client, &sac, 10_000);
+        let treasury = client.get_treasury();
+
+        let token_client = token::Client::new(&env, &token_addr);
+
+        // Default fee is 50 bps: gross 10_000 splits into beneficiary
+        // payout 9_950 and treasury fee 50. Burn exactly 50 from the
+        // TrustFlow contract so the first transfer can execute but the
+        // second transfer fails due to insufficient remaining balance.
+        token_client.burn(&client.address, &50);
+
+        let beneficiary_balance_before = balance(&env, &token_addr, &beneficiary);
+        let treasury_balance_before = balance(&env, &token_addr, &treasury);
+        let contract_balance_before = balance(&env, &token_addr, &client.address);
+        assert_eq!(contract_balance_before, 9_950);
+        assert_eq!(beneficiary_balance_before, 0);
+        assert_eq!(treasury_balance_before, 0);
+
+        let escrow_before = read_escrow(&env, &client.address, escrow_id);
+        assert_eq!(escrow_before.amount, 10_000);
+
+        let milestone_released_before =
+            read_milestone_released(&env, &client.address, escrow_id, 0u32);
+        let escrow_released_before = read_escrow_released(&env, &client.address, escrow_id);
+
+        let result = client.try_release_milestone_tranche(&escrow_id, &0u32, &10_000, &depositor);
+        assert_eq!(result, Err(Ok(TrustFlowError::TokenTransferFailed)));
+
+        // Nothing must have moved or been recorded: the failed treasury leg
+        // must roll back the beneficiary transfer and all accounting too.
+        // The pre-existing burn is not itself rolled back -- it happened
+        // before (and independently of) the failed release invocation.
+        assert_eq!(
+            balance(&env, &token_addr, &beneficiary),
+            beneficiary_balance_before
+        );
+        assert_eq!(
+            balance(&env, &token_addr, &treasury),
+            treasury_balance_before
+        );
+        assert_eq!(balance(&env, &token_addr, &client.address), 9_950);
+
+        let escrow_after = read_escrow(&env, &client.address, escrow_id);
+        assert_eq!(escrow_after.status, EscrowStatus::Active);
+        assert_eq!(escrow_after.status, escrow_before.status);
+        assert!(!escrow_after.milestones.get(0).unwrap().approved);
+        assert_eq!(
+            read_milestone_released(&env, &client.address, escrow_id, 0u32),
+            milestone_released_before
+        );
+        assert_eq!(
+            read_escrow_released(&env, &client.address, escrow_id),
+            escrow_released_before
+        );
+
+        // Failed token calls may remain visible in the test event log.
+        // Verify specifically that TrustFlow did not emit its success event.
+        let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> = (
+            symbol_short!("mstone"),
+            symbol_short!("release"),
+            escrow_id,
+            0u32,
+        )
+            .into_val(&env);
+
+        let emitted_release_event =
+            env.events()
+                .all()
+                .iter()
+                .any(|(event_contract, event_topics, _)| {
+                    event_contract == client.address && event_topics == expected_topics
+                });
+
+        assert!(!emitted_release_event);
     }
 }
