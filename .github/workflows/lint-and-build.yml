@@ -56,7 +56,7 @@ jobs:
       - name: Build all WASM contracts
         run: |
           cd contracts
-          for contract in abundance crowdfund mock-token; do
+          for contract in abundance crowdfund mock-token trustflow; do
             echo "Building $contract..."
             cd $contract
             soroban contract build
