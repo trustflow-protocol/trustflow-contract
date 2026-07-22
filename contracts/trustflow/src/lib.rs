@@ -38,6 +38,13 @@ const LEDGERS_PER_DAY: u32 = 17_280;
 /// allowed to lapse before an escrow's persistent TTL, the whole contract
 /// would archive first and no one could call `bump_escrow_ttl` to save it.
 /// Keeping both on the same clock means one keeper call refreshes both.
+///
+/// 90/30 are conservative round numbers, not derived from a formula against
+/// expected ledger close times — they're a deliberately generous starting
+/// point (escrows are the whole point of this contract, so we'd rather
+/// over-provision TTL than under-provision it) and a reasonable target for a
+/// keeper to poll on a monthly-ish cadence. Revisit if real-world keeper
+/// cadence or rent costs suggest a tighter window.
 const BUMP_AMOUNT: u32 = 90 * LEDGERS_PER_DAY;
 const LIFETIME_THRESHOLD: u32 = 30 * LEDGERS_PER_DAY;
 const INSTANCE_BUMP_AMOUNT: u32 = BUMP_AMOUNT;
@@ -85,6 +92,7 @@ pub enum TrustFlowError {
     InsufficientStake = 8,
     NoVotesCast = 9,
     MilestoneAmountMismatch = 10,
+    JurorStakeNotFound = 11,
 }
 
 // ---------------------------------------------------------------------------
@@ -109,6 +117,15 @@ pub struct EscrowInitialized {
 #[derive(Clone, Debug)]
 pub struct EscrowTtlBumped {
     pub escrow_id: u64,
+    pub live_until_ledger: u32,
+}
+
+/// Emitted by [`TrustFlow::bump_juror_stake_ttl`]. Same caveat on
+/// `live_until_ledger` as [`EscrowTtlBumped`].
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct JurorStakeTtlBumped {
+    pub juror: Address,
     pub live_until_ledger: u32,
 }
 
@@ -280,12 +297,36 @@ impl TrustFlow {
     /// periodic maintenance their stake entry could archive and, on the
     /// next dispute they are drawn into, `resolve_dispute` would be unable
     /// to read or slash it — bricking settlement for whichever escrow's
-    /// dispute is waiting on that resolution. No-op (not an error) if the
-    /// juror has no stake on record.
-    pub fn bump_juror_stake_ttl(env: Env, juror: Address) {
+    /// dispute is waiting on that resolution.
+    ///
+    /// Returns the ledger sequence up to which the stake is now guaranteed
+    /// to live. Errors (no state change, no event) if the juror has no
+    /// stake on record — mirrors `bump_escrow_ttl`'s error-on-nonexistent
+    /// behavior rather than silently no-op'ing, so a bump always means
+    /// "there was live state and its TTL was refreshed."
+    pub fn bump_juror_stake_ttl(env: Env, juror: Address) -> Result<u32, TrustFlowError> {
+        let stake_key = DataKey::JurorStake(juror.clone());
+        if !env.storage().persistent().has(&stake_key) {
+            return Err(TrustFlowError::JurorStakeNotFound);
+        }
+
         extend_instance_ttl(&env);
-        extend_persistent_ttl(&env, &DataKey::JurorStake(juror.clone()));
-        extend_persistent_ttl(&env, &DataKey::JurorSlashCount(juror));
+        extend_persistent_ttl(&env, &stake_key);
+        extend_persistent_ttl(&env, &DataKey::JurorSlashCount(juror.clone()));
+
+        let live_until_ledger = env
+            .ledger()
+            .sequence()
+            .saturating_add(PERSISTENT_BUMP_AMOUNT);
+        env.events().publish(
+            (symbol_short!("juror"), symbol_short!("ttlbump")),
+            JurorStakeTtlBumped {
+                juror,
+                live_until_ledger,
+            },
+        );
+
+        Ok(live_until_ledger)
     }
 
     // -----------------------------------------------------------------------
@@ -1370,6 +1411,88 @@ mod tests {
 
         let decoded = EscrowTtlBumped::try_from_val(&env, &event_data).unwrap();
         assert_eq!(decoded.escrow_id, escrow_id);
+        assert_eq!(decoded.live_until_ledger, expected_live_until);
+    }
+
+    #[test]
+    fn test_bump_escrow_ttl_triggers_exactly_at_threshold_boundary() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        mint(&sac, &depositor, 500);
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &500);
+
+        // Advance so the escrow has *exactly* PERSISTENT_LIFETIME_THRESHOLD
+        // ledgers of TTL remaining (created at seq 0 with an expiration of
+        // PERSISTENT_BUMP_AMOUNT, so this advance leaves precisely that much
+        // remaining) — the boundary the host's `remaining <= threshold`
+        // check is defined on.
+        advance_ledger(&env, PERSISTENT_BUMP_AMOUNT - PERSISTENT_LIFETIME_THRESHOLD);
+        client.bump_escrow_ttl(&escrow_id);
+
+        // Advance one ledger past what the *original* un-bumped expiration
+        // would have been. If the threshold check were exclusive (`<`
+        // instead of `<=`) the bump above would have been skipped as "not
+        // yet due" and this read would hit a truly expired entry; since it
+        // succeeds, the refresh fired at exactly the documented boundary,
+        // not one ledger late.
+        advance_ledger(&env, PERSISTENT_LIFETIME_THRESHOLD + 1);
+
+        client.raise_dispute(
+            &escrow_id,
+            &depositor,
+            &String::from_slice(&env, "right at the boundary"),
+        );
+    }
+
+    #[test]
+    fn test_bump_juror_stake_ttl_nonexistent_juror_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, _sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let juror = Address::random(&env);
+
+        let result = client.try_bump_juror_stake_ttl(&juror);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_bump_juror_stake_ttl_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let juror = Address::random(&env);
+        mint(&sac, &juror, 500);
+        client.stake(&juror, &500);
+
+        advance_ledger(
+            &env,
+            PERSISTENT_BUMP_AMOUNT - PERSISTENT_LIFETIME_THRESHOLD + 1,
+        );
+
+        let live_until = client.bump_juror_stake_ttl(&juror);
+
+        let expected_live_until = env
+            .ledger()
+            .sequence()
+            .saturating_add(PERSISTENT_BUMP_AMOUNT);
+        assert_eq!(live_until, expected_live_until);
+
+        let (event_contract, event_topics, event_data) = env.events().all().last().unwrap();
+        assert_eq!(event_contract, client.address);
+
+        let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+            (symbol_short!("juror"), symbol_short!("ttlbump")).into_val(&env);
+        assert_eq!(event_topics, expected_topics);
+
+        let decoded = JurorStakeTtlBumped::try_from_val(&env, &event_data).unwrap();
+        assert_eq!(decoded.juror, juror);
         assert_eq!(decoded.live_until_ledger, expected_live_until);
     }
 
