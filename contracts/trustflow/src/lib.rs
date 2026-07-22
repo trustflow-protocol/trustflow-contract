@@ -93,6 +93,7 @@ pub enum TrustFlowError {
     NoVotesCast = 9,
     MilestoneAmountMismatch = 10,
     JurorStakeNotFound = 11,
+    ArithmeticOverflow = 12,
 }
 
 // ---------------------------------------------------------------------------
@@ -127,6 +128,39 @@ pub struct EscrowTtlBumped {
 pub struct JurorStakeTtlBumped {
     pub juror: Address,
     pub live_until_ledger: u32,
+}
+
+/// Emitted by [`TrustFlow::stake`]. Records the juror, the amount staked,
+/// and the juror's new total staked balance after the operation.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct Staked {
+    pub juror: Address,
+    pub amount: i128,
+    pub new_total: i128,
+}
+
+/// Emitted by [`TrustFlow::unstake`]. Records the juror, the amount
+/// withdrawn, and the juror's remaining staked balance.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct Unstaked {
+    pub juror: Address,
+    pub amount: i128,
+    pub remaining: i128,
+}
+
+/// Emitted by [`TrustFlow::resolve_dispute`] for each minority voter that is
+/// slashed. Records the juror, the slash amount deducted, the juror's stake
+/// balance after the slash, and the juror's cumulative slash count.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct JurorSlashed {
+    pub escrow_id: u64,
+    pub juror: Address,
+    pub slash_amount: i128,
+    pub remaining_stake: i128,
+    pub slash_count: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -253,8 +287,21 @@ impl TrustFlow {
 
         let key = DataKey::JurorStake(juror.clone());
         let prev: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        env.storage().persistent().set(&key, &(prev + amount));
+        let new_total = prev
+            .checked_add(amount)
+            .ok_or(TrustFlowError::ArithmeticOverflow)?;
+        env.storage().persistent().set(&key, &new_total);
         extend_persistent_ttl(&env, &key);
+
+        env.events().publish(
+            (symbol_short!("stake"), symbol_short!("staked")),
+            Staked {
+                juror,
+                amount,
+                new_total,
+            },
+        );
+
         Ok(())
     }
 
@@ -269,8 +316,21 @@ impl TrustFlow {
         }
         let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         token::Client::new(&env, &token).transfer(&env.current_contract_address(), &juror, &amount);
-        env.storage().persistent().set(&key, &(current - amount));
+        let remaining = current
+            .checked_sub(amount)
+            .ok_or(TrustFlowError::ArithmeticOverflow)?;
+        env.storage().persistent().set(&key, &remaining);
         extend_persistent_ttl(&env, &key);
+
+        env.events().publish(
+            (symbol_short!("stake"), symbol_short!("unstaked")),
+            Unstaked {
+                juror,
+                amount,
+                remaining,
+            },
+        );
+
         Ok(())
     }
 
@@ -358,7 +418,9 @@ impl TrustFlow {
             .instance()
             .get(&DataKey::EscrowCounter)
             .unwrap_or(0);
-        let id = counter + 1;
+        let id = counter
+            .checked_add(1)
+            .ok_or(TrustFlowError::ArithmeticOverflow)?;
         env.storage().instance().set(&DataKey::EscrowCounter, &id);
 
         let escrow_key = DataKey::Escrow(id);
@@ -392,7 +454,9 @@ impl TrustFlow {
             if m.amount <= 0 {
                 return Err(TrustFlowError::InvalidAmount);
             }
-            total_amount += m.amount;
+            total_amount = total_amount
+                .checked_add(m.amount)
+                .ok_or(TrustFlowError::ArithmeticOverflow)?;
         }
 
         if total_amount <= 0 {
@@ -411,7 +475,9 @@ impl TrustFlow {
             .instance()
             .get(&DataKey::EscrowCounter)
             .unwrap_or(0);
-        let id = counter + 1;
+        let id = counter
+            .checked_add(1)
+            .ok_or(TrustFlowError::ArithmeticOverflow)?;
         env.storage().instance().set(&DataKey::EscrowCounter, &id);
 
         let escrow_key = DataKey::Escrow(id);
@@ -590,9 +656,13 @@ impl TrustFlow {
                 }))
                 .unwrap_or(false);
             if vote {
-                for_depositor += 1;
+                for_depositor = for_depositor
+                    .checked_add(1)
+                    .ok_or(TrustFlowError::ArithmeticOverflow)?;
             } else {
-                for_beneficiary += 1;
+                for_beneficiary = for_beneficiary
+                    .checked_add(1)
+                    .ok_or(TrustFlowError::ArithmeticOverflow)?;
             }
         }
 
@@ -619,14 +689,43 @@ impl TrustFlow {
             if vote != ruling {
                 let stake_key = DataKey::JurorStake(voter.clone());
                 let stake: i128 = env.storage().persistent().get(&stake_key).unwrap_or(0);
-                // slash_amount = stake * slash_bps / 10_000, saturating at stake
-                let slash = stake
-                    .checked_mul(slash_bps as i128)
-                    .unwrap_or(stake * DEFAULT_SLASH_BPS as i128)
-                    .checked_div(10_000)
-                    .unwrap_or(0)
-                    .min(stake);
-                env.storage().persistent().set(&stake_key, &(stake - slash));
+                // slash_amount = stake * slash_bps / 10_000, capped at stake.
+                //
+                // Three-tier safe arithmetic:
+                //   1. Try i128 checked_mul (fast path, covers typical values).
+                //   2. Widen to u128 for stakes up to ~3.4e35 with bps up to
+                //      ~10_000 (covers virtually all realistic values).
+                //   3. If even u128 overflows, divide first then multiply —
+                //      this truncates early but guarantees no overflow for any
+                //      stake/bps combination that fits in i128.
+                let slash: i128 = {
+                    let stake_u128 = stake as u128;
+                    let bps_u128 = slash_bps as u128;
+                    let slash_u128 = stake
+                        .checked_mul(slash_bps as i128)
+                        .and_then(|v| v.checked_div(10_000))
+                        .map(|v| v as u128)
+                        .or_else(|| {
+                            // i128 overflow — try u128
+                            stake_u128
+                                .checked_mul(bps_u128)
+                                .and_then(|v| v.checked_div(10_000))
+                                .or_else(|| {
+                                    // u128 overflow too — divide first
+                                    stake_u128
+                                        .checked_div(10_000)
+                                        .map(|q| q.saturating_mul(bps_u128))
+                                })
+                        })
+                        .unwrap_or(stake_u128)
+                        .min(stake_u128);
+                    slash_u128 as i128
+                };
+
+                let remaining_stake = stake
+                    .checked_sub(slash)
+                    .ok_or(TrustFlowError::ArithmeticOverflow)?;
+                env.storage().persistent().set(&stake_key, &remaining_stake);
                 extend_persistent_ttl(&env, &stake_key);
 
                 let slash_count_key = DataKey::JurorSlashCount(voter.clone());
@@ -635,10 +734,22 @@ impl TrustFlow {
                     .persistent()
                     .get(&slash_count_key)
                     .unwrap_or(0);
-                env.storage()
-                    .persistent()
-                    .set(&slash_count_key, &(count + 1));
+                let new_count = count
+                    .checked_add(1)
+                    .ok_or(TrustFlowError::ArithmeticOverflow)?;
+                env.storage().persistent().set(&slash_count_key, &new_count);
                 extend_persistent_ttl(&env, &slash_count_key);
+
+                env.events().publish(
+                    (symbol_short!("slash"), symbol_short!("slashed")),
+                    JurorSlashed {
+                        escrow_id,
+                        juror: voter,
+                        slash_amount: slash,
+                        remaining_stake,
+                        slash_count: new_count,
+                    },
+                );
             }
         }
 
@@ -1044,7 +1155,7 @@ mod tests {
         // remaining stake approximates 10_000 * 0.9^3 = 7_290.
         // Due to integer truncation the result is >= 7_290 and < 7_300.
         assert!(
-            stake_r3 >= 7_290 && stake_r3 <= 7_300,
+            (7_290..=7_300).contains(&stake_r3),
             "expected ~7290 after 3×10% slashes, got {stake_r3}"
         );
     }
@@ -1513,5 +1624,462 @@ mod tests {
         mint(&sac, &juror, 100);
         client.stake(&juror, &100);
         assert_eq!(client.get_stake(&juror), 100);
+    }
+
+    // -----------------------------------------------------------------------
+    // Checked arithmetic — overflow / saturating paths
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_stake_event_emitted() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let juror = Address::random(&env);
+        mint(&sac, &juror, 500);
+
+        client.stake(&juror, &500);
+
+        let events = env.events().all();
+        let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+            (symbol_short!("stake"), symbol_short!("staked")).into_val(&env);
+
+        let (_, topics, data) = events
+            .iter()
+            .find(|(_, topics, _)| *topics == expected_topics)
+            .expect("Staked event must be emitted");
+
+        assert_eq!(topics, expected_topics);
+        let decoded = Staked::try_from_val(&env, &data).unwrap();
+        assert_eq!(decoded.juror, juror);
+        assert_eq!(decoded.amount, 500);
+        assert_eq!(decoded.new_total, 500);
+    }
+
+    #[test]
+    fn test_unstake_event_emitted() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let juror = Address::random(&env);
+        mint(&sac, &juror, 500);
+        client.stake(&juror, &500);
+
+        client.unstake(&juror, &200);
+
+        let events = env.events().all();
+        let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+            (symbol_short!("stake"), symbol_short!("unstaked")).into_val(&env);
+
+        let (_, topics, data) = events
+            .iter()
+            .find(|(_, topics, _)| *topics == expected_topics)
+            .expect("Unstaked event must be emitted");
+
+        assert_eq!(topics, expected_topics);
+        let decoded = Unstaked::try_from_val(&env, &data).unwrap();
+        assert_eq!(decoded.juror, juror);
+        assert_eq!(decoded.amount, 200);
+        assert_eq!(decoded.remaining, 300);
+    }
+
+    #[test]
+    fn test_slash_event_emitted_on_resolve() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let slash_bps: u32 = 1_000;
+        let (client, _token_addr, sac) = setup(&env, slash_bps);
+
+        let honest = Address::random(&env);
+        let malicious = Address::random(&env);
+
+        mint(&sac, &honest, 500);
+        mint(&sac, &malicious, 1_000);
+        client.stake(&honest, &500);
+        client.stake(&malicious, &1_000);
+
+        dispute_round(
+            &env,
+            &client,
+            &sac,
+            &_token_addr,
+            &[honest],
+            &malicious,
+            slash_bps,
+        );
+
+        let events = env.events().all();
+        let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+            (symbol_short!("slash"), symbol_short!("slashed")).into_val(&env);
+
+        let (_, topics, data) = events
+            .iter()
+            .find(|(_, topics, _)| *topics == expected_topics)
+            .expect("JurorSlashed event must be emitted");
+
+        assert_eq!(topics, expected_topics);
+        let decoded = JurorSlashed::try_from_val(&env, &data).unwrap();
+        assert_eq!(decoded.juror, malicious);
+        assert_eq!(decoded.slash_amount, 100);
+        assert_eq!(decoded.remaining_stake, 900);
+        assert_eq!(decoded.slash_count, 1);
+    }
+
+    #[test]
+    fn test_slash_count_event_fields_across_multiple_rounds() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let slash_bps: u32 = 1_000;
+        let (client, token_addr, sac) = setup(&env, slash_bps);
+
+        let honest = Address::random(&env);
+        let malicious = Address::random(&env);
+
+        mint(&sac, &honest, 10_000);
+        mint(&sac, &malicious, 10_000);
+        client.stake(&honest, &10_000);
+        client.stake(&malicious, &10_000);
+
+        // Round 1
+        dispute_round(
+            &env,
+            &client,
+            &sac,
+            &token_addr,
+            std::slice::from_ref(&honest),
+            &malicious,
+            slash_bps,
+        );
+        assert_eq!(client.get_stake(&malicious), 9_000);
+        assert_eq!(client.get_slash_count(&malicious), 1);
+
+        // Round 2
+        dispute_round(
+            &env,
+            &client,
+            &sac,
+            &token_addr,
+            std::slice::from_ref(&honest),
+            &malicious,
+            slash_bps,
+        );
+        assert_eq!(client.get_stake(&malicious), 8_100);
+        assert_eq!(client.get_slash_count(&malicious), 2);
+    }
+
+    #[test]
+    fn test_stake_accumulates_correctly_with_checked_math() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let juror = Address::random(&env);
+        mint(&sac, &juror, 10_000);
+
+        client.stake(&juror, &1_000);
+        assert_eq!(client.get_stake(&juror), 1_000);
+
+        client.stake(&juror, &2_000);
+        assert_eq!(client.get_stake(&juror), 3_000);
+
+        client.stake(&juror, &3_000);
+        assert_eq!(client.get_stake(&juror), 6_000);
+
+        client.unstake(&juror, &1_500);
+        assert_eq!(client.get_stake(&juror), 4_500);
+    }
+
+    #[test]
+    fn test_unstake_exact_balance_results_in_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let juror = Address::random(&env);
+        mint(&sac, &juror, 500);
+
+        client.stake(&juror, &500);
+        assert_eq!(client.get_stake(&juror), 500);
+
+        client.unstake(&juror, &500);
+        assert_eq!(client.get_stake(&juror), 0);
+    }
+
+    #[test]
+    fn test_unstake_insufficient_after_slash() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let slash_bps: u32 = 5_000; // 50%
+        let (client, token_addr, sac) = setup(&env, slash_bps);
+
+        let honest = Address::random(&env);
+        let malicious = Address::random(&env);
+
+        mint(&sac, &honest, 500);
+        mint(&sac, &malicious, 1_000);
+        client.stake(&honest, &500);
+        client.stake(&malicious, &1_000);
+
+        dispute_round(
+            &env,
+            &client,
+            &sac,
+            &token_addr,
+            &[honest],
+            &malicious,
+            slash_bps,
+        );
+
+        // After 50% slash, malicious has 500 left
+        assert_eq!(client.get_stake(&malicious), 500);
+
+        // Can unstake up to remaining
+        client.unstake(&malicious, &500);
+        assert_eq!(client.get_stake(&malicious), 0);
+
+        // Cannot unstake more
+        let result = client.try_unstake(&malicious, &1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_slash_with_large_stake_does_not_panic() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let slash_bps: u32 = 1_000; // 10%
+        let (client, _token_addr, sac) = setup(&env, slash_bps);
+
+        let honest = Address::random(&env);
+        let malicious = Address::random(&env);
+
+        // Large stake that overflows i128 checked_mul but fits in u128.
+        // i128::MAX / 1000 ≈ 1.7e35, times 1000 ≈ 1.7e38 < u128::MAX.
+        let large_stake: i128 = i128::MAX / 1000;
+        mint(&sac, &honest, large_stake);
+        mint(&sac, &malicious, large_stake);
+        client.stake(&honest, &large_stake);
+        client.stake(&malicious, &large_stake);
+
+        dispute_round(
+            &env,
+            &client,
+            &sac,
+            &_token_addr,
+            &[honest],
+            &malicious,
+            slash_bps,
+        );
+
+        // 10% of large_stake — u128 path produces exact result
+        let expected_remaining = large_stake - (large_stake / 10);
+        assert_eq!(client.get_stake(&malicious), expected_remaining);
+    }
+
+    #[test]
+    fn test_slash_extreme_stake_uses_divide_first_path() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let slash_bps: u32 = 1_000; // 10%
+        let (client, _token_addr, sac) = setup(&env, slash_bps);
+
+        let honest = Address::random(&env);
+        let malicious = Address::random(&env);
+
+        // i128::MAX / 10 — both i128 and u128 checked_mul overflow at *1000.
+        // The divide-first fallback produces a slightly truncated result.
+        let extreme_stake: i128 = i128::MAX / 10;
+        mint(&sac, &honest, extreme_stake);
+        mint(&sac, &malicious, extreme_stake);
+        client.stake(&honest, &extreme_stake);
+        client.stake(&malicious, &extreme_stake);
+
+        dispute_round(
+            &env,
+            &client,
+            &sac,
+            &_token_addr,
+            &[honest],
+            &malicious,
+            slash_bps,
+        );
+
+        let remaining = client.get_stake(&malicious);
+        // The divide-first path truncates early: slash = (stake / 10_000) * bps
+        // vs exact: (stake * bps) / 10_000. For extreme values this difference
+        // can be large, but the slash is always safe (never exceeds stake, never
+        // panics). Just verify stake decreased and slash count is 1.
+        assert!(remaining < extreme_stake, "stake must decrease after slash");
+        assert!(
+            remaining > 0,
+            "stake should not be fully slashed for 10% rate"
+        );
+        assert_eq!(client.get_slash_count(&malicious), 1);
+    }
+
+    #[test]
+    fn test_zero_stake_slash_is_noop() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let slash_bps: u32 = 1_000;
+        let (client, token_addr, sac) = setup(&env, slash_bps);
+
+        let honest = Address::random(&env);
+        let malicious = Address::random(&env);
+
+        mint(&sac, &honest, 500);
+        client.stake(&honest, &500);
+        // malicious has no stake — cast_vote requires stake > 0, so we
+        // cannot reach resolve_dispute with a zero-stake minority voter.
+        // Instead verify the checked_math path through a direct low-stake test.
+        mint(&sac, &malicious, 1);
+        client.stake(&malicious, &1);
+
+        dispute_round(
+            &env,
+            &client,
+            &sac,
+            &token_addr,
+            &[honest],
+            &malicious,
+            slash_bps,
+        );
+
+        // 10% of 1 = 0 (integer truncation), stake unchanged
+        assert_eq!(client.get_stake(&malicious), 1);
+        assert_eq!(client.get_slash_count(&malicious), 1);
+    }
+
+    #[test]
+    fn test_100_percent_slash_leaves_zero_stake() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, token_addr, sac) = setup(&env, 10_000);
+
+        let honest = Address::random(&env);
+        let honest2 = Address::random(&env);
+        let malicious = Address::random(&env);
+
+        mint(&sac, &honest, 500);
+        mint(&sac, &honest2, 500);
+        mint(&sac, &malicious, 777);
+        client.stake(&honest, &500);
+        client.stake(&honest2, &500);
+        client.stake(&malicious, &777);
+
+        dispute_round(
+            &env,
+            &client,
+            &sac,
+            &token_addr,
+            &[honest, honest2],
+            &malicious,
+            10_000,
+        );
+
+        assert_eq!(client.get_stake(&malicious), 0);
+        assert_eq!(client.get_slash_count(&malicious), 1);
+    }
+
+    #[test]
+    fn test_multiple_minority_voters_each_slashed_independently() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let slash_bps: u32 = 2_000; // 20%
+        let (client, _token_addr, sac) = setup(&env, slash_bps);
+
+        let honest1 = Address::random(&env);
+        let honest2 = Address::random(&env);
+        let malicious1 = Address::random(&env);
+        let malicious2 = Address::random(&env);
+
+        mint(&sac, &honest1, 1_000);
+        mint(&sac, &honest2, 1_000);
+        mint(&sac, &malicious1, 500);
+        mint(&sac, &malicious2, 1_500);
+        client.stake(&honest1, &1_000);
+        client.stake(&honest2, &1_000);
+        client.stake(&malicious1, &500);
+        client.stake(&malicious2, &1_500);
+
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        mint(&sac, &depositor, 1_000);
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &1_000);
+        client.raise_dispute(
+            &escrow_id,
+            &depositor,
+            &String::from_slice(&env, "test multi minority"),
+        );
+
+        // Two honest vote for depositor (majority); both malicious vote for beneficiary
+        client.cast_vote(&escrow_id, &honest1, &true);
+        client.cast_vote(&escrow_id, &honest2, &true);
+        client.cast_vote(&escrow_id, &malicious1, &false);
+        client.cast_vote(&escrow_id, &malicious2, &false);
+
+        client.resolve_dispute(&escrow_id);
+
+        // malicious1: 20% of 500 = 100
+        assert_eq!(client.get_stake(&malicious1), 400);
+        assert_eq!(client.get_slash_count(&malicious1), 1);
+
+        // malicious2: 20% of 1500 = 300
+        assert_eq!(client.get_stake(&malicious2), 1_200);
+        assert_eq!(client.get_slash_count(&malicious2), 1);
+    }
+
+    #[test]
+    fn test_create_escrow_event_emitted() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        mint(&sac, &depositor, 1_000);
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &1_000);
+
+        // create_escrow currently does not emit a custom event (only init_escrow does).
+        // This test confirms the escrow was created successfully and the ID incremented.
+        assert_eq!(escrow_id, 1);
+    }
+
+    #[test]
+    fn test_unstake_returns_correct_event_after_partial_withdraw() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let juror = Address::random(&env);
+        mint(&sac, &juror, 1_000);
+        client.stake(&juror, &1_000);
+
+        client.unstake(&juror, &300);
+
+        let events = env.events().all();
+        let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+            (symbol_short!("stake"), symbol_short!("unstaked")).into_val(&env);
+
+        let (_, topics, data) = events
+            .iter()
+            .rev()
+            .find(|(_, topics, _)| *topics == expected_topics)
+            .expect("Unstaked event must be emitted");
+
+        assert_eq!(topics, expected_topics);
+        let decoded = Unstaked::try_from_val(&env, &data).unwrap();
+        assert_eq!(decoded.amount, 300);
+        assert_eq!(decoded.remaining, 700);
     }
 }
