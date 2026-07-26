@@ -223,11 +223,42 @@ pub enum TrustFlowError {
     InvalidReveal = 20,
     /// `resolve_dispute` called before the reveal window has closed.
     RevealPhaseNotEnded = 21,
+    /// Returned when a sensitive contract entrypoint is called while the contract is paused.
+    ContractPaused = 22,
 }
 
 // ---------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------
+
+/// Emitted when the contract is emergency paused by admin or pauser.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ContractPaused {
+    pub caller: Address,
+}
+
+/// Emitted when the contract is unpaused by admin.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ContractUnpaused {
+    pub admin: Address,
+}
+
+/// Emitted when a pauser role is assigned by admin.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PauserSet {
+    pub admin: Address,
+    pub pauser: Address,
+}
+
+/// Emitted when the pauser role is revoked by admin.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PauserRevoked {
+    pub admin: Address,
+}
 
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -364,6 +395,25 @@ pub enum DataKey {
     JurorVote(VoteKey),
     /// How many times a juror has been slashed (u32)
     JurorSlashCount(Address),
+    /// Whether sensitive contract operations are emergency paused (bool)
+    Paused,
+    /// Granular role: address authorized to trigger emergency pause (Address)
+    Pauser,
+}
+
+/// Helper function that returns `Err(TrustFlowError::ContractPaused)` if the
+/// contract is currently paused.
+fn require_not_paused(env: &Env) -> Result<(), TrustFlowError> {
+    let paused: bool = env
+        .storage()
+        .instance()
+        .get(&DataKey::Paused)
+        .unwrap_or(false);
+    if paused {
+        Err(TrustFlowError::ContractPaused)
+    } else {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -502,6 +552,125 @@ impl TrustFlow {
     }
 
     // -----------------------------------------------------------------------
+    // Role-Based Emergency Pause & Circuit Breaker
+    // -----------------------------------------------------------------------
+
+    /// Admin-only: grant the pause-only role to `pauser`.
+    ///
+    /// The pauser address can call [`pause`] to trigger a circuit breaker in an
+    /// emergency, but cannot call [`unpause`].
+    pub fn set_pauser(
+        env: Env,
+        caller: Address,
+        pauser: Address,
+    ) -> Result<(), TrustFlowError> {
+        caller.require_auth();
+        extend_instance_ttl(&env);
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != admin {
+            return Err(TrustFlowError::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::Pauser, &pauser);
+        env.events().publish(
+            (symbol_short!("pauser"), symbol_short!("set")),
+            PauserSet {
+                admin: caller,
+                pauser,
+            },
+        );
+        Ok(())
+    }
+
+    /// Admin-only: revoke the pauser role.
+    pub fn revoke_pauser(env: Env, caller: Address) -> Result<(), TrustFlowError> {
+        caller.require_auth();
+        extend_instance_ttl(&env);
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != admin {
+            return Err(TrustFlowError::Unauthorized);
+        }
+        env.storage().instance().remove(&DataKey::Pauser);
+        env.events().publish(
+            (symbol_short!("pauser"), symbol_short!("revoke")),
+            PauserRevoked { admin: caller },
+        );
+        Ok(())
+    }
+
+    /// Return the current pauser address, if set.
+    pub fn get_pauser(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Pauser)
+    }
+
+    /// Emergency pause the contract. Callable by Admin OR Pauser role.
+    ///
+    /// Halts all sensitive state-mutating entrypoints immediately.
+    pub fn pause(env: Env, caller: Address) -> Result<(), TrustFlowError> {
+        caller.require_auth();
+        extend_instance_ttl(&env);
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let pauser: Option<Address> = env.storage().instance().get(&DataKey::Pauser);
+
+        let is_admin = caller == admin;
+        let is_pauser = pauser.map_or(false, |p| caller == p);
+
+        if !is_admin && !is_pauser {
+            return Err(TrustFlowError::Unauthorized);
+        }
+
+        let currently_paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
+
+        if !currently_paused {
+            env.storage().instance().set(&DataKey::Paused, &true);
+            env.events().publish(
+                (symbol_short!("circuit"), symbol_short!("pause")),
+                ContractPaused { caller },
+            );
+        }
+        Ok(())
+    }
+
+    /// Resume normal contract operations. Admin-only.
+    ///
+    /// The Pauser role cannot call this function — only the Admin can resume
+    /// operations after an incident investigation.
+    pub fn unpause(env: Env, caller: Address) -> Result<(), TrustFlowError> {
+        caller.require_auth();
+        extend_instance_ttl(&env);
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != admin {
+            return Err(TrustFlowError::Unauthorized);
+        }
+
+        let currently_paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
+
+        if currently_paused {
+            env.storage().instance().set(&DataKey::Paused, &false);
+            env.events().publish(
+                (symbol_short!("circuit"), symbol_short!("unpause")),
+                ContractUnpaused { admin: caller },
+            );
+        }
+        Ok(())
+    }
+
+    /// Return whether the contract is currently emergency paused.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    // -----------------------------------------------------------------------
     // Juror staking
     // -----------------------------------------------------------------------
 
@@ -509,6 +678,7 @@ impl TrustFlow {
     pub fn stake(env: Env, juror: Address, amount: i128) -> Result<(), TrustFlowError> {
         juror.require_auth();
         extend_instance_ttl(&env);
+        require_not_paused(&env)?;
         if amount <= 0 {
             return Err(TrustFlowError::InvalidAmount);
         }
@@ -526,6 +696,7 @@ impl TrustFlow {
     pub fn unstake(env: Env, juror: Address, amount: i128) -> Result<(), TrustFlowError> {
         juror.require_auth();
         extend_instance_ttl(&env);
+        require_not_paused(&env)?;
         let key = DataKey::JurorStake(juror.clone());
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
         if current < amount {
@@ -600,6 +771,7 @@ impl TrustFlow {
     ) -> Result<u64, TrustFlowError> {
         depositor.require_auth();
         extend_instance_ttl(&env);
+        require_not_paused(&env)?;
         if amount <= 0 {
             return Err(TrustFlowError::InvalidAmount);
         }
@@ -644,6 +816,7 @@ impl TrustFlow {
     ) -> Result<u64, TrustFlowError> {
         depositor.require_auth();
         extend_instance_ttl(&env);
+        require_not_paused(&env)?;
 
         let mut total_amount: i128 = 0;
         for m in milestones.iter() {
@@ -721,6 +894,7 @@ impl TrustFlow {
         // call, so there is no way to end up with mismatched books.
         caller.require_auth();
         extend_instance_ttl(&env);
+        require_not_paused(&env)?;
 
         if gross_amount <= 0 {
             return Err(TrustFlowError::InvalidAmount);
@@ -859,6 +1033,7 @@ impl TrustFlow {
     ) -> Result<(), TrustFlowError> {
         caller.require_auth();
         extend_instance_ttl(&env);
+        require_not_paused(&env)?;
         let escrow_key = DataKey::Escrow(escrow_id);
         let mut escrow: EscrowRecord = env
             .storage()
@@ -917,6 +1092,7 @@ impl TrustFlow {
     ) -> Result<(), TrustFlowError> {
         juror.require_auth();
         extend_instance_ttl(&env);
+        require_not_paused(&env)?;
 
         let stake: i128 = env
             .storage()
@@ -976,6 +1152,7 @@ impl TrustFlow {
     ) -> Result<(), TrustFlowError> {
         juror.require_auth();
         extend_instance_ttl(&env);
+        require_not_paused(&env)?;
 
         let dispute_key = DataKey::Dispute(escrow_id);
         let dispute: DisputeRecord = env
@@ -1051,6 +1228,7 @@ impl TrustFlow {
     /// Returns `true` if the ruling is for the depositor, `false` otherwise.
     pub fn resolve_dispute(env: Env, escrow_id: u64) -> Result<bool, TrustFlowError> {
         extend_instance_ttl(&env);
+        require_not_paused(&env)?;
         let dispute_key = DataKey::Dispute(escrow_id);
         let mut dispute: DisputeRecord = env
             .storage()
@@ -2970,4 +3148,290 @@ mod tests {
 
         assert!(!emitted_release_event);
     }
+
+    // -----------------------------------------------------------------------
+    // Role-Based Emergency Pause & Circuit Breaker Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pause_and_unpause_by_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _token_addr, _sac) = setup(&env, 1000);
+        let admin = env.as_contract(&client.address, || {
+            env.storage().instance().get(&DataKey::Admin).unwrap()
+        });
+
+        assert!(!client.is_paused());
+
+        // Admin pauses
+        client.pause(&admin);
+        assert!(client.is_paused());
+
+        // Admin unpauses
+        client.unpause(&admin);
+        assert!(!client.is_paused());
+    }
+
+    #[test]
+    fn test_pauser_role_can_pause_and_cannot_unpause() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _token_addr, _sac) = setup(&env, 1000);
+        let admin: Address = env.as_contract(&client.address, || {
+            env.storage().instance().get(&DataKey::Admin).unwrap()
+        });
+        let pauser = Address::random(&env);
+
+        // Set pauser role
+        client.set_pauser(&admin, &pauser);
+        assert_eq!(client.get_pauser(), Some(pauser.clone()));
+
+        // Pauser can trigger emergency pause
+        client.pause(&pauser);
+        assert!(client.is_paused());
+
+        // Pauser CANNOT unpause (only Admin can)
+        assert_eq!(
+            client.try_unpause(&pauser),
+            Err(Ok(TrustFlowError::Unauthorized))
+        );
+        assert!(client.is_paused());
+
+        // Admin can unpause
+        client.unpause(&admin);
+        assert!(!client.is_paused());
+    }
+
+    #[test]
+    fn test_set_and_revoke_pauser_admin_only() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _token_addr, _sac) = setup(&env, 1000);
+        let admin: Address = env.as_contract(&client.address, || {
+            env.storage().instance().get(&DataKey::Admin).unwrap()
+        });
+        let pauser = Address::random(&env);
+        let outsider = Address::random(&env);
+
+        // Outsider cannot set pauser
+        assert_eq!(
+            client.try_set_pauser(&outsider, &pauser),
+            Err(Ok(TrustFlowError::Unauthorized))
+        );
+        assert_eq!(client.get_pauser(), None);
+
+        // Admin sets pauser
+        client.set_pauser(&admin, &pauser);
+        assert_eq!(client.get_pauser(), Some(pauser.clone()));
+
+        // Outsider cannot revoke pauser
+        assert_eq!(
+            client.try_revoke_pauser(&outsider),
+            Err(Ok(TrustFlowError::Unauthorized))
+        );
+        assert_eq!(client.get_pauser(), Some(pauser.clone()));
+
+        // Admin revokes pauser
+        client.revoke_pauser(&admin);
+        assert_eq!(client.get_pauser(), None);
+
+        // Revoked pauser can no longer pause
+        assert_eq!(
+            client.try_pause(&pauser),
+            Err(Ok(TrustFlowError::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn test_unauthorized_callers_cannot_pause_or_unpause() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _token_addr, _sac) = setup(&env, 1000);
+        let outsider = Address::random(&env);
+
+        assert_eq!(
+            client.try_pause(&outsider),
+            Err(Ok(TrustFlowError::Unauthorized))
+        );
+        assert_eq!(
+            client.try_unpause(&outsider),
+            Err(Ok(TrustFlowError::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn test_circuit_breaker_halts_sensitive_entrypoints() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _token_addr, sac) = setup(&env, 1000);
+        let admin: Address = env.as_contract(&client.address, || {
+            env.storage().instance().get(&DataKey::Admin).unwrap()
+        });
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        let juror = Address::random(&env);
+
+        mint(&sac, &depositor, 100_000);
+        mint(&sac, &juror, 100_000);
+
+        // Pause the contract
+        client.pause(&admin);
+        assert!(client.is_paused());
+
+        // 1. stake is blocked
+        assert_eq!(
+            client.try_stake(&juror, &10_000),
+            Err(Ok(TrustFlowError::ContractPaused))
+        );
+
+        // 2. unstake is blocked
+        assert_eq!(
+            client.try_unstake(&juror, &1_000),
+            Err(Ok(TrustFlowError::ContractPaused))
+        );
+
+        // 3. create_escrow is blocked
+        assert_eq!(
+            client.try_create_escrow(&depositor, &beneficiary, &50_000),
+            Err(Ok(TrustFlowError::ContractPaused))
+        );
+
+        // 4. init_escrow is blocked
+        let milestones = soroban_sdk::vec![
+            &env,
+            Milestone {
+                label: String::from_slice(&env, "M1"),
+                amount: 50_000,
+                approved: false,
+            }
+        ];
+        assert_eq!(
+            client.try_init_escrow(&depositor, &beneficiary, &milestones),
+            Err(Ok(TrustFlowError::ContractPaused))
+        );
+
+        // Unpause to create an active escrow for remaining entrypoint checks
+        client.unpause(&admin);
+        let escrow_id = client.init_escrow(&depositor, &beneficiary, &milestones);
+        client.stake(&juror, &10_000);
+
+        // Re-pause
+        client.pause(&admin);
+
+        // 5. release_milestone_tranche is blocked
+        assert_eq!(
+            client.try_release_milestone_tranche(&escrow_id, &0u32, &50_000, &depositor),
+            Err(Ok(TrustFlowError::ContractPaused))
+        );
+
+        // 6. raise_dispute is blocked
+        assert_eq!(
+            client.try_raise_dispute(&escrow_id, &depositor, &String::from_slice(&env, "Issue")),
+            Err(Ok(TrustFlowError::ContractPaused))
+        );
+
+        // Unpause to raise dispute
+        client.unpause(&admin);
+        client.raise_dispute(&escrow_id, &depositor, &String::from_slice(&env, "Issue"));
+
+        // Re-pause
+        client.pause(&admin);
+
+        // 7. commit_vote is blocked
+        let commitment = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
+        assert_eq!(
+            client.try_commit_vote(&escrow_id, &juror, &commitment),
+            Err(Ok(TrustFlowError::ContractPaused))
+        );
+
+        // 8. reveal_vote is blocked
+        let salt = soroban_sdk::BytesN::from_array(&env, &[2u8; 32]);
+        assert_eq!(
+            client.try_reveal_vote(&escrow_id, &juror, &true, &salt),
+            Err(Ok(TrustFlowError::ContractPaused))
+        );
+
+        // 9. resolve_dispute is blocked
+        assert_eq!(
+            client.try_resolve_dispute(&escrow_id),
+            Err(Ok(TrustFlowError::ContractPaused))
+        );
+    }
+
+    #[test]
+    fn test_read_only_and_maintenance_work_during_pause() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _token_addr, sac) = setup(&env, 1000);
+        let admin: Address = env.as_contract(&client.address, || {
+            env.storage().instance().get(&DataKey::Admin).unwrap()
+        });
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        let juror = Address::random(&env);
+
+        mint(&sac, &depositor, 100_000);
+        mint(&sac, &juror, 100_000);
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &50_000);
+        client.stake(&juror, &10_000);
+
+        // Emergency Pause
+        client.pause(&admin);
+
+        // Read-only queries must still work:
+        assert_eq!(client.get_fee_bps(), 50);
+        assert_eq!(client.get_stake(&juror), 10_000);
+        assert_eq!(client.get_slash_count(&juror), 0);
+        assert!(client.is_paused());
+
+        // Storage maintenance (TTL bump) must still work (returns ledger seq):
+        assert!(client.bump_escrow_ttl(&escrow_id) > 0);
+        assert!(client.bump_juror_stake_ttl(&juror) > 0);
+    }
+
+    #[test]
+    fn test_unpause_resumes_operations_funds_not_stranded() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, token_addr, sac) = setup(&env, 1000);
+        let admin: Address = env.as_contract(&client.address, || {
+            env.storage().instance().get(&DataKey::Admin).unwrap()
+        });
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+
+        mint(&sac, &depositor, 100_000);
+
+        let milestones = soroban_sdk::vec![
+            &env,
+            Milestone {
+                label: String::from_slice(&env, "M1"),
+                amount: 50_000,
+                approved: false,
+            }
+        ];
+        let escrow_id = client.init_escrow(&depositor, &beneficiary, &milestones);
+
+        // Incident occurs: Pauser pauses contract
+        let pauser = Address::random(&env);
+        client.set_pauser(&admin, &pauser);
+        client.pause(&pauser);
+
+        // Actions blocked
+        assert_eq!(
+            client.try_release_milestone_tranche(&escrow_id, &0u32, &50_000, &depositor),
+            Err(Ok(TrustFlowError::ContractPaused))
+        );
+
+        // Incident resolved: Admin unpauses
+        client.unpause(&admin);
+
+        // Normal operations resume, funds released successfully
+        client.release_milestone_tranche(&escrow_id, &0u32, &50_000, &depositor);
+
+        assert_eq!(balance(&env, &token_addr, &beneficiary), 49_750);
+    }
 }
+
