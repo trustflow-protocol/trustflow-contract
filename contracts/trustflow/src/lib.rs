@@ -559,11 +559,7 @@ impl TrustFlow {
     ///
     /// The pauser address can call [`pause`] to trigger a circuit breaker in an
     /// emergency, but cannot call [`unpause`].
-    pub fn set_pauser(
-        env: Env,
-        caller: Address,
-        pauser: Address,
-    ) -> Result<(), TrustFlowError> {
+    pub fn set_pauser(env: Env, caller: Address, pauser: Address) -> Result<(), TrustFlowError> {
         caller.require_auth();
         extend_instance_ttl(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
@@ -3434,4 +3430,3 @@ mod tests {
         assert_eq!(balance(&env, &token_addr, &beneficiary), 49_750);
     }
 }
-
