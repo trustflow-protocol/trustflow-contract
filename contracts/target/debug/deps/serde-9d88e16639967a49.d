@@ -1,0 +1,14 @@
+/home/idealz/Drips-Projects/trustflow-contract/contracts/target/debug/deps/serde-9d88e16639967a49.d: /home/idealz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /home/idealz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /home/idealz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /home/idealz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /home/idealz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /home/idealz/Drips-Projects/trustflow-contract/contracts/target/debug/build/serde-46367230ef002103/out/private.rs
+
+/home/idealz/Drips-Projects/trustflow-contract/contracts/target/debug/deps/libserde-9d88e16639967a49.rlib: /home/idealz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /home/idealz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /home/idealz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /home/idealz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /home/idealz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /home/idealz/Drips-Projects/trustflow-contract/contracts/target/debug/build/serde-46367230ef002103/out/private.rs
+
+/home/idealz/Drips-Projects/trustflow-contract/contracts/target/debug/deps/libserde-9d88e16639967a49.rmeta: /home/idealz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /home/idealz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /home/idealz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /home/idealz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /home/idealz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /home/idealz/Drips-Projects/trustflow-contract/contracts/target/debug/build/serde-46367230ef002103/out/private.rs
+
+/home/idealz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs:
+/home/idealz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs:
+/home/idealz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs:
+/home/idealz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs:
+/home/idealz/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs:
+/home/idealz/Drips-Projects/trustflow-contract/contracts/target/debug/build/serde-46367230ef002103/out/private.rs:
+
+# env-dep:OUT_DIR=/home/idealz/Drips-Projects/trustflow-contract/contracts/target/debug/build/serde-46367230ef002103/out
