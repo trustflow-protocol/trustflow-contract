@@ -326,6 +326,36 @@ pub struct VoteRevealed {
     pub vote_for_depositor: bool,
 }
 
+/// Emitted by [`TrustFlow::stake`] when a juror adds stake.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct Staked {
+    pub juror: Address,
+    pub amount: i128,
+    pub new_total: i128,
+}
+
+/// Emitted by [`TrustFlow::unstake`] when a juror withdraws stake.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct Unstaked {
+    pub juror: Address,
+    pub amount: i128,
+    pub remaining: i128,
+}
+
+/// Emitted by [`TrustFlow::resolve_dispute`] when a juror on the losing side
+/// is slashed.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct JurorSlashed {
+    pub escrow_id: u64,
+    pub juror: Address,
+    pub slash_amount: i128,
+    pub remaining_stake: i128,
+    pub slash_count: u32,
+}
+
 // ---------------------------------------------------------------------------
 // Storage types
 // ---------------------------------------------------------------------------
