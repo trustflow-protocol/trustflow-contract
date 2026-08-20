@@ -53,12 +53,22 @@ const LEDGERS_PER_DAY: u32 = 17_280;
 // locked in before the commit window closes, and the reveal window only
 // opens once no further commitments are possible, so no juror can ever see
 // another's vote before their own is already fixed on-chain.
+// TODO: consider making these admin-configurable in a follow-up PR so the
+// commit/reveal windows can be tuned without a contract upgrade.
 const COMMIT_WINDOW_LEDGERS: u32 = LEDGERS_PER_DAY;
 const REVEAL_WINDOW_LEDGERS: u32 = LEDGERS_PER_DAY;
 
 /// Hashes a `(vote, salt)` pair into the commitment format used by
-/// `commit_vote`/`reveal_vote`: `sha256(vote_byte ++ salt)`. Callers building
-/// a commitment off-chain must reproduce this exact preimage layout.
+/// `commit_vote`/`reveal_vote`: `sha256(vote_byte ++ salt)`.
+///
+/// Preimage layout (33 bytes total):
+///   [0]     vote_byte — 0x01 (for depositor) or 0x00 (for beneficiary)
+///   [1..33] salt      — 32 bytes of caller-chosen randomness
+///
+/// Callers building a commitment off-chain must reproduce this exact
+/// concatenation. The salt length is enforced to 32 bytes by the
+/// [`BytesN<32>`] type at the contract boundary; off-chain tooling must
+/// pad or generate 32 bytes accordingly.
 fn hash_vote(env: &Env, vote_for_depositor: bool, salt: &BytesN<32>) -> BytesN<32> {
     let mut preimage = Bytes::new(env);
     preimage.push_back(if vote_for_depositor { 1u8 } else { 0u8 });
@@ -1151,6 +1161,16 @@ impl TrustFlow {
     /// (or via [`TrustFlow::hash_vote`] in tests) and keep `vote` and `salt`
     /// secret until the reveal phase. Only callable before the dispute's
     /// commit window closes.
+    ///
+    /// **Hash preimage format** (for integrators building commitments
+    /// off-chain):
+    /// - `vote_byte`: `0x01` if voting for the depositor, `0x00` if voting
+    ///   for the beneficiary (single byte).
+    /// - `salt`: exactly 32 bytes of caller-chosen randomness (the
+    ///   [`BytesN<32>`] type enforces this length on-chain; off-chain
+    ///   tooling must pad or generate 32 bytes).
+    /// - The preimage is the concatenation `[vote_byte, salt[0], salt[1],
+    ///   ..., salt[31]]` (33 bytes total), hashed with SHA-256.
     pub fn commit_vote(
         env: Env,
         escrow_id: u64,
@@ -1208,8 +1228,20 @@ impl TrustFlow {
     /// revealed `(vote_for_depositor, salt)` pair must hash to the juror's
     /// stored commitment.
     ///
+    /// After a successful reveal the stored commitment is cleared to free
+    /// storage and prevent accidental reuse; the vote itself is recorded
+    /// under [`DataKey::JurorVote`] and the juror is appended to the
+    /// dispute's voter list.
+    ///
+    /// Replay protection: a second call for the same `(escrow_id, juror)`
+    /// is rejected with [`TrustFlowError::AlreadyVoted`] because the
+    /// [`DataKey::JurorVote`] entry already exists.
+    ///
     /// * `vote_for_depositor` – `true` rules in favour of the depositor;
     ///   `false` rules in favour of the beneficiary.
+    /// * `salt` – the exact 32-byte salt used when computing the
+    ///   commitment. Must match the preimage documented in
+    ///   [`TrustFlow::commit_vote`].
     pub fn reveal_vote(
         env: Env,
         escrow_id: u64,
@@ -1235,6 +1267,17 @@ impl TrustFlow {
             return Err(TrustFlowError::RevealPhaseNotOpen);
         }
 
+        // Check AlreadyVoted before NoCommitFound: after a successful
+        // reveal the commitment is cleared, so a duplicate reveal would
+        // otherwise surface the wrong error.
+        let vote_key = DataKey::JurorVote(VoteKey {
+            escrow_id,
+            juror: juror.clone(),
+        });
+        if env.storage().persistent().has(&vote_key) {
+            return Err(TrustFlowError::AlreadyVoted);
+        }
+
         let commit_key = DataKey::JurorCommit(VoteKey {
             escrow_id,
             juror: juror.clone(),
@@ -1245,14 +1288,6 @@ impl TrustFlow {
             .get(&commit_key)
             .ok_or(TrustFlowError::NoCommitFound)?;
 
-        let vote_key = DataKey::JurorVote(VoteKey {
-            escrow_id,
-            juror: juror.clone(),
-        });
-        if env.storage().persistent().has(&vote_key) {
-            return Err(TrustFlowError::AlreadyVoted);
-        }
-
         if hash_vote(&env, vote_for_depositor, &salt) != commitment {
             return Err(TrustFlowError::InvalidReveal);
         }
@@ -1261,6 +1296,9 @@ impl TrustFlow {
             .persistent()
             .set(&vote_key, &vote_for_depositor);
         extend_persistent_ttl(&env, &vote_key);
+
+        // Clear the commitment to free storage and prevent accidental reuse.
+        env.storage().persistent().remove(&commit_key);
 
         let voters_key = DataKey::DisputeVoters(escrow_id);
         let mut voters: Vec<Address> = env
@@ -1917,7 +1955,44 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_dispute_before_reveal_deadline_rejected() {
+    fn test_same_salt_across_different_disputes_does_not_collide() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor1 = Address::random(&env);
+        let beneficiary1 = Address::random(&env);
+        let depositor2 = Address::random(&env);
+        let beneficiary2 = Address::random(&env);
+        let juror = Address::random(&env);
+
+        mint(&sac, &depositor1, 500);
+        mint(&sac, &depositor2, 500);
+        mint(&sac, &juror, 400);
+        client.stake(&juror, &400);
+
+        let escrow1 = client.create_escrow(&depositor1, &beneficiary1, &500);
+        let escrow2 = client.create_escrow(&depositor2, &beneficiary2, &500);
+
+        client.raise_dispute(&escrow1, &depositor1, &String::from_slice(&env, "d1"));
+        client.raise_dispute(&escrow2, &depositor2, &String::from_slice(&env, "d2"));
+
+        // Same salt and vote direction, but different disputes.
+        let salt = test_salt(&env);
+        let commitment = hash_vote(&env, true, &salt);
+        client.commit_vote(&escrow1, &juror, &commitment);
+        client.commit_vote(&escrow2, &juror, &commitment);
+
+        advance_ledger(&env, COMMIT_WINDOW_LEDGERS);
+
+        // Both reveals must succeed — commitments are keyed by
+        // (escrow_id, juror), so the same salt does not collide.
+        client.reveal_vote(&escrow1, &juror, &true, &salt);
+        client.reveal_vote(&escrow2, &juror, &true, &salt);
+    }
+
+    #[test]
+    fn test_commitment_cleared_after_reveal() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -1936,57 +2011,23 @@ mod tests {
         let salt = test_salt(&env);
         let commitment = hash_vote(&env, true, &salt);
         client.commit_vote(&escrow_id, &juror, &commitment);
+
+        // Commitment exists before reveal.
+        let commit_key = DataKey::JurorCommit(VoteKey {
+            escrow_id,
+            juror: juror.clone(),
+        });
+        assert!(env.as_contract(&client.address, || {
+            env.storage().persistent().has(&commit_key)
+        }));
+
         advance_ledger(&env, COMMIT_WINDOW_LEDGERS);
         client.reveal_vote(&escrow_id, &juror, &true, &salt);
 
-        // Reveal window is still open — too early to resolve.
-        let result = client.try_resolve_dispute(&escrow_id);
-        assert_eq!(result, Err(Ok(TrustFlowError::RevealPhaseNotEnded)));
-    }
-
-    #[test]
-    fn test_committed_but_unrevealed_vote_not_counted() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let (client, token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
-        let depositor = Address::random(&env);
-        let beneficiary = Address::random(&env);
-        let revealer = Address::random(&env);
-        let silent = Address::random(&env);
-
-        mint(&sac, &depositor, 500);
-        mint(&sac, &revealer, 200);
-        mint(&sac, &silent, 200);
-        client.stake(&revealer, &200);
-        client.stake(&silent, &200);
-
-        let escrow_id = client.create_escrow(&depositor, &beneficiary, &500);
-        client.raise_dispute(&escrow_id, &depositor, &String::from_slice(&env, "test"));
-
-        let salt = test_salt(&env);
-        let commitment = hash_vote(&env, false, &salt);
-        client.commit_vote(&escrow_id, &revealer, &commitment);
-        client.commit_vote(&escrow_id, &silent, &commitment);
-
-        advance_ledger(&env, COMMIT_WINDOW_LEDGERS);
-        // Only `revealer` reveals; `silent` commits but never reveals.
-        client.reveal_vote(&escrow_id, &revealer, &false, &salt);
-        advance_ledger(&env, REVEAL_WINDOW_LEDGERS);
-
-        // `silent`'s vote never entered the tally, so the lone revealed
-        // vote (for the beneficiary) rules unopposed.
-        let ruling = client.resolve_dispute(&escrow_id);
-        assert!(
-            !ruling,
-            "unopposed revealed vote should rule for beneficiary"
-        );
-        assert_eq!(balance(&env, &token_addr, &beneficiary), 500);
-
-        // `silent` was never counted, so they are not slashed either —
-        // they simply forfeited their say in this dispute.
-        assert_eq!(client.get_slash_count(&silent), 0);
-        assert_eq!(client.get_stake(&silent), 200);
+        // Commitment must be cleared after a successful reveal.
+        assert!(!env.as_contract(&client.address, || {
+            env.storage().persistent().has(&commit_key)
+        }));
     }
 
     // -----------------------------------------------------------------------
@@ -2306,6 +2347,91 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_dispute_before_reveal_deadline_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        let juror = Address::random(&env);
+
+        mint(&sac, &depositor, 500);
+        mint(&sac, &juror, 200);
+        client.stake(&juror, &200);
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &500);
+        client.raise_dispute(&escrow_id, &depositor, &String::from_slice(&env, "test"));
+
+        let salt = test_salt(&env);
+        let commitment = hash_vote(&env, true, &salt);
+        client.commit_vote(&escrow_id, &juror, &commitment);
+        advance_ledger(&env, COMMIT_WINDOW_LEDGERS);
+        client.reveal_vote(&escrow_id, &juror, &true, &salt);
+
+        // Reveal window is still open — resolve_dispute must be rejected.
+        let result = client.try_resolve_dispute(&escrow_id);
+        assert_eq!(result, Err(Ok(TrustFlowError::RevealPhaseNotEnded)));
+    }
+
+    #[test]
+    fn test_committed_but_unrevealed_vote_not_counted() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        let juror_a = Address::random(&env);
+        let juror_b = Address::random(&env);
+        let silent_juror = Address::random(&env);
+
+        mint(&sac, &depositor, 500);
+        mint(&sac, &juror_a, 200);
+        mint(&sac, &juror_b, 200);
+        mint(&sac, &silent_juror, 200);
+
+        client.stake(&juror_a, &200);
+        client.stake(&juror_b, &200);
+        client.stake(&silent_juror, &200);
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &500);
+        client.raise_dispute(&escrow_id, &depositor, &String::from_slice(&env, "test"));
+
+        let salt = test_salt(&env);
+        // All three commit, but only two reveal.
+        let commitment_for = hash_vote(&env, true, &salt);
+        let commitment_against = hash_vote(&env, false, &salt);
+        client.commit_vote(&escrow_id, &juror_a, &commitment_for);
+        client.commit_vote(&escrow_id, &juror_b, &commitment_against);
+        client.commit_vote(&escrow_id, &silent_juror, &commitment_for);
+
+        advance_ledger(&env, COMMIT_WINDOW_LEDGERS);
+
+        client.reveal_vote(&escrow_id, &juror_a, &true, &salt);
+        client.reveal_vote(&escrow_id, &juror_b, &false, &salt);
+        // silent_juror does NOT reveal
+
+        advance_ledger(&env, REVEAL_WINDOW_LEDGERS);
+        let ruling = client.resolve_dispute(&escrow_id);
+
+        // Depositor wins (1 for, 1 against, tie favours depositor)
+        assert!(ruling, "tie should rule for depositor");
+
+        // juror_b voted against and must be slashed
+        assert_eq!(client.get_slash_count(&juror_b), 1);
+        assert!(client.get_stake(&juror_b) < 200);
+
+        // silent_juror committed but never revealed — no slash, no vote counted
+        assert_eq!(client.get_slash_count(&silent_juror), 0);
+        assert_eq!(client.get_stake(&silent_juror), 200);
+
+        // juror_a voted with majority — no slash
+        assert_eq!(client.get_slash_count(&juror_a), 0);
+        assert_eq!(client.get_stake(&juror_a), 200);
+    }
+
+    #[test]
     fn test_slash_cannot_exceed_stake() {
         let env = Env::default();
         env.mock_all_auths();
@@ -2469,6 +2595,11 @@ mod tests {
             &depositor,
             &String::from_slice(&env, "slow juror"),
         );
+
+        // Commit before the large ledger advance (which would blow past the
+        // commit deadline).
+        let commitment = hash_vote(&env, true, &test_salt(&env));
+        client.commit_vote(&escrow_id, &juror, &commitment);
 
         // A keeper sweep well before anything would lapse: bumps the escrow
         // (and its dispute) as well as the juror's still-idle stake, since
