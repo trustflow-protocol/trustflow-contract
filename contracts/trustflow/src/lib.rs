@@ -2504,6 +2504,87 @@ mod tests {
         assert_eq!(escrow_id, 1);
     }
 
+    #[test]
+    fn test_init_escrow_empty_milestones_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        mint(&sac, &depositor, 1_000);
+
+        let milestones = Vec::new(&env);
+        let res = client.try_init_escrow(&depositor, &beneficiary, &milestones);
+        assert_eq!(res, Err(Ok(TrustFlowError::InvalidAmount)));
+    }
+
+    #[test]
+    fn test_init_escrow_zero_or_negative_amount_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        mint(&sac, &depositor, 1_000);
+
+        let zero_milestones = Vec::from_array(
+            &env,
+            [Milestone {
+                label: String::from_slice(&env, "Zero"),
+                amount: 0,
+                approved: false,
+                release_time: 0,
+            }],
+        );
+        let res = client.try_init_escrow(&depositor, &beneficiary, &zero_milestones);
+        assert_eq!(res, Err(Ok(TrustFlowError::InvalidAmount)));
+
+        let neg_milestones = Vec::from_array(
+            &env,
+            [Milestone {
+                label: String::from_slice(&env, "Negative"),
+                amount: -100,
+                approved: false,
+                release_time: 0,
+            }],
+        );
+        let res_neg = client.try_init_escrow(&depositor, &beneficiary, &neg_milestones);
+        assert_eq!(res_neg, Err(Ok(TrustFlowError::InvalidAmount)));
+    }
+
+    #[test]
+    fn test_init_escrow_overflow_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        mint(&sac, &depositor, 1_000);
+
+        let overflow_milestones = Vec::from_array(
+            &env,
+            [
+                Milestone {
+                    label: String::from_slice(&env, "Max"),
+                    amount: i128::MAX,
+                    approved: false,
+                    release_time: 0,
+                },
+                Milestone {
+                    label: String::from_slice(&env, "Extra"),
+                    amount: 1,
+                    approved: false,
+                    release_time: 0,
+                },
+            ],
+        );
+        let res = client.try_init_escrow(&depositor, &beneficiary, &overflow_milestones);
+        assert_eq!(res, Err(Ok(TrustFlowError::ArithmeticOverflow)));
+    }
+
     // -----------------------------------------------------------------------
     // State archival / TTL bump strategy
     // -----------------------------------------------------------------------
