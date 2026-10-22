@@ -1,0 +1,14 @@
+/home/lynndabel/trustflow-contract/contracts/target/debug/deps/serde-83971a6c0d6fc1f1.d: /home/lynndabel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /home/lynndabel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /home/lynndabel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /home/lynndabel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /home/lynndabel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /home/lynndabel/trustflow-contract/contracts/target/debug/build/serde-8c63de14314a3a66/out/private.rs
+
+/home/lynndabel/trustflow-contract/contracts/target/debug/deps/libserde-83971a6c0d6fc1f1.rlib: /home/lynndabel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /home/lynndabel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /home/lynndabel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /home/lynndabel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /home/lynndabel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /home/lynndabel/trustflow-contract/contracts/target/debug/build/serde-8c63de14314a3a66/out/private.rs
+
+/home/lynndabel/trustflow-contract/contracts/target/debug/deps/libserde-83971a6c0d6fc1f1.rmeta: /home/lynndabel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs /home/lynndabel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs /home/lynndabel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs /home/lynndabel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs /home/lynndabel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs /home/lynndabel/trustflow-contract/contracts/target/debug/build/serde-8c63de14314a3a66/out/private.rs
+
+/home/lynndabel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/lib.rs:
+/home/lynndabel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/integer128.rs:
+/home/lynndabel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/mod.rs:
+/home/lynndabel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/de.rs:
+/home/lynndabel/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.229/src/private/ser.rs:
+/home/lynndabel/trustflow-contract/contracts/target/debug/build/serde-8c63de14314a3a66/out/private.rs:
+
+# env-dep:OUT_DIR=/home/lynndabel/trustflow-contract/contracts/target/debug/build/serde-8c63de14314a3a66/out
