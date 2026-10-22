@@ -1,11 +1,200 @@
 #![cfg_attr(not(test), no_std)]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, vec, Address, Env, String, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Bytes,
+    BytesN, Env, IntoVal, String, Val, Vec,
 };
 
 /// Slash rate in basis points applied to minority voters (10% = 1000 bps)
 const DEFAULT_SLASH_BPS: u32 = 1_000;
+
+/// Default protocol fee charged on milestone tranche releases, in basis
+/// points (50 = 0.50%). Snapshotted onto each escrow at creation time (see
+/// [`EscrowFeeConfig`]) unless the admin has since changed the global
+/// default via [`TrustFlow::set_fee_bps`].
+const DEFAULT_FEE_BPS: u32 = 50;
+
+/// Upper bound the admin may configure the global protocol fee to via
+/// [`TrustFlow::set_fee_bps`] (1_000 bps = 10%).
+const MAX_FEE_BPS: u32 = 1_000;
+
+/// Denominator basis points are expressed against (10_000 bps = 100%).
+const BPS_DENOMINATOR: i128 = 10_000;
+
+// ---------------------------------------------------------------------------
+// State archival / TTL bump strategy
+// ---------------------------------------------------------------------------
+//
+// Soroban expires (archives) `persistent` and `instance` storage entries once
+// their time-to-live (TTL) reaches zero. An archived entry cannot be read or
+// written by a contract call again until it is restored via a separate
+// `RestoreFootprintOp`, which requires the archived ledger key to still be
+// known off-chain. Escrows in TrustFlow are frequently long-lived (milestone
+// projects, disputes awaiting jurors) and may go untouched for far longer
+// than a persistent entry's default TTL, so every persistent write below is
+// paired with an immediate TTL bump, and `bump_escrow_ttl` is exposed so
+// anyone (e.g. a keeper/cron job) can keep a dormant escrow alive without
+// needing to mutate its state.
+//
+// One ledger closes roughly every 5 seconds.
+const LEDGERS_PER_DAY: u32 = 17_280;
+
+// ---------------------------------------------------------------------------
+// Commit-reveal juror voting
+// ---------------------------------------------------------------------------
+//
+// Direct voting (`cast_vote`) let a juror see how many others had already
+// voted, and for which side, before casting their own — a bribing party
+// could pay only jurors who vote with (or against) the emerging majority,
+// and jurors could simply copy whichever side looked ahead. Splitting
+// voting into a commit phase (submit `sha256(vote_byte ++ salt)`, revealing
+// nothing) followed by a reveal phase (disclose `vote` + `salt`, checked
+// against the stored commitment) removes that signal: every commitment is
+// locked in before the commit window closes, and the reveal window only
+// opens once no further commitments are possible, so no juror can ever see
+// another's vote before their own is already fixed on-chain.
+// TODO: consider making these admin-configurable in a follow-up PR so the
+// commit/reveal windows can be tuned without a contract upgrade.
+const COMMIT_WINDOW_LEDGERS: u32 = LEDGERS_PER_DAY;
+const REVEAL_WINDOW_LEDGERS: u32 = LEDGERS_PER_DAY;
+
+/// Hashes a `(vote, salt)` pair into the commitment format used by
+/// `commit_vote`/`reveal_vote`: `sha256(vote_byte ++ salt)`.
+///
+/// Preimage layout (33 bytes total):
+///   [0]     vote_byte — 0x01 (for depositor) or 0x00 (for beneficiary)
+///   [1..33] salt      — 32 bytes of caller-chosen randomness
+///
+/// Callers building a commitment off-chain must reproduce this exact
+/// concatenation. The salt length is enforced to 32 bytes by the
+/// [`BytesN<32>`] type at the contract boundary; off-chain tooling must
+/// pad or generate 32 bytes accordingly.
+fn hash_vote(env: &Env, vote_for_depositor: bool, salt: &BytesN<32>) -> BytesN<32> {
+    let mut preimage = Bytes::new(env);
+    preimage.push_back(if vote_for_depositor { 1u8 } else { 0u8 });
+    preimage.append(&salt.clone().into());
+    env.crypto().sha256(&preimage)
+}
+
+/// Escrow/dispute/juror persistent records — and the contract instance
+/// itself (admin/token/slash config/escrow counter) — are bumped to live 90
+/// days out once they have less than 30 days of TTL remaining. Escrows are
+/// expected to significantly outlive the SDK's default entry TTL, and
+/// `bump_escrow_ttl` is the sole heartbeat a fully dormant escrow gets.
+///
+/// The instance and persistent watermarks are intentionally identical:
+/// every contract call — `bump_escrow_ttl` included — needs the *instance*
+/// to still be live just to be invoked at all, so if instance TTL were ever
+/// allowed to lapse before an escrow's persistent TTL, the whole contract
+/// would archive first and no one could call `bump_escrow_ttl` to save it.
+/// Keeping both on the same clock means one keeper call refreshes both.
+///
+/// 90/30 are conservative round numbers, not derived from a formula against
+/// expected ledger close times — they're a deliberately generous starting
+/// point (escrows are the whole point of this contract, so we'd rather
+/// over-provision TTL than under-provision it) and a reasonable target for a
+/// keeper to poll on a monthly-ish cadence. Revisit if real-world keeper
+/// cadence or rent costs suggest a tighter window.
+const BUMP_AMOUNT: u32 = 90 * LEDGERS_PER_DAY;
+const LIFETIME_THRESHOLD: u32 = 30 * LEDGERS_PER_DAY;
+const INSTANCE_BUMP_AMOUNT: u32 = BUMP_AMOUNT;
+const INSTANCE_LIFETIME_THRESHOLD: u32 = LIFETIME_THRESHOLD;
+const PERSISTENT_BUMP_AMOUNT: u32 = BUMP_AMOUNT;
+const PERSISTENT_LIFETIME_THRESHOLD: u32 = LIFETIME_THRESHOLD;
+
+/// Extends the current contract instance's TTL. Cheap to call repeatedly:
+/// the host only writes a new TTL when the instance is within
+/// [`INSTANCE_LIFETIME_THRESHOLD`] ledgers of expiring.
+fn extend_instance_ttl(env: &Env) {
+    env.storage()
+        .instance()
+        .bump(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+}
+
+/// Extends a persistent storage entry's TTL. No-op if the entry does not
+/// exist, and cheap to call repeatedly for the same reason as above.
+fn extend_persistent_ttl<K>(env: &Env, key: &K)
+where
+    K: IntoVal<Env, Val>,
+{
+    if env.storage().persistent().has(key) {
+        env.storage()
+            .persistent()
+            .bump(key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+    }
+}
+
+/// Computes `floor(amount * fee_bps / 10_000)` without ever forming the
+/// (potentially overflowing) product `amount * fee_bps` directly.
+///
+/// `amount` is decomposed as `quotient * 10_000 + remainder` (via integer
+/// div/mod), so `amount * fee_bps / 10_000 == quotient * fee_bps +
+/// remainder * fee_bps / 10_000`, and `remainder < 10_000` keeps the second
+/// multiplication small regardless of how large `amount` is. Every step is
+/// checked so an impossible overflow is reported as an error rather than
+/// silently wrapping.
+///
+/// Used to charge each milestone tranche exactly
+/// `cumulative_fee(released_after) - cumulative_fee(released_before)`, which
+/// guarantees fragmenting one release into many never changes the total fee
+/// collected.
+fn cumulative_fee(amount: i128, fee_bps: u32) -> Result<i128, TrustFlowError> {
+    if amount == 0 {
+        return Ok(0);
+    }
+    let fee_bps = fee_bps as i128;
+    let quotient = amount / BPS_DENOMINATOR;
+    let remainder = amount % BPS_DENOMINATOR;
+
+    let quotient_fee = quotient
+        .checked_mul(fee_bps)
+        .ok_or(TrustFlowError::InvalidAmount)?;
+    let remainder_fee = remainder
+        .checked_mul(fee_bps)
+        .ok_or(TrustFlowError::InvalidAmount)?
+        / BPS_DENOMINATOR;
+
+    quotient_fee
+        .checked_add(remainder_fee)
+        .ok_or(TrustFlowError::InvalidAmount)
+}
+
+/// Snapshots the current global `FeeBps`/`Treasury` defaults onto a
+/// newly-created escrow. Called once, right after the escrow record itself
+/// is persisted, from both `create_escrow` and `init_escrow`. Once written
+/// this snapshot is never mutated by later `set_fee_bps` calls.
+fn snapshot_fee_config(env: &Env, escrow_id: u64) {
+    let fee_bps: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::FeeBps)
+        .unwrap_or(DEFAULT_FEE_BPS);
+    let treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
+
+    let fee_config_key = DataKey::EscrowFeeConfig(escrow_id);
+    env.storage()
+        .persistent()
+        .set(&fee_config_key, &EscrowFeeConfig { treasury, fee_bps });
+    extend_persistent_ttl(env, &fee_config_key);
+}
+
+fn try_token_transfer(
+    env: &Env,
+    token_address: &Address,
+    from: &Address,
+    to: &Address,
+    amount: i128,
+) -> Result<(), TrustFlowError> {
+    if amount == 0 {
+        return Ok(());
+    }
+
+    let token_client = token::Client::new(env, token_address);
+    match token_client.try_transfer(from, to, &amount) {
+        Ok(Ok(())) => Ok(()),
+        _ => Err(TrustFlowError::TokenTransferFailed),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -24,6 +213,157 @@ pub enum TrustFlowError {
     AlreadyVoted = 7,
     InsufficientStake = 8,
     NoVotesCast = 9,
+    MilestoneAmountMismatch = 10,
+    JurorStakeNotFound = 11,
+    MilestoneNotFound = 12,
+    InvalidFeeBps = 13,
+    ArithmeticOverflow = 14,
+    TokenTransferFailed = 15,
+    /// `commit_vote` called after the dispute's commit window has closed.
+    CommitPhaseEnded = 16,
+    /// `reveal_vote` called outside the reveal window (either before the
+    /// commit window has closed, or after the reveal window has closed).
+    RevealPhaseNotOpen = 17,
+    /// A juror committed to a dispute more than once.
+    AlreadyCommitted = 18,
+    /// `reveal_vote` called by a juror with no matching commitment on file.
+    NoCommitFound = 19,
+    /// The revealed `(vote, salt)` pair does not hash to the juror's stored
+    /// commitment.
+    InvalidReveal = 20,
+    /// `resolve_dispute` called before the reveal window has closed.
+    RevealPhaseNotEnded = 21,
+    /// Returned when a sensitive contract entrypoint is called while the contract is paused.
+    ContractPaused = 22,
+    /// `release_milestone_tranche` called before the milestone's time-lock has expired.
+    MilestoneTimeLocked = 23,
+}
+
+// ---------------------------------------------------------------------------
+// Events
+// ---------------------------------------------------------------------------
+
+/// Emitted when the contract is emergency paused by admin or pauser.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ContractPaused {
+    pub caller: Address,
+}
+
+/// Emitted when the contract is unpaused by admin.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ContractUnpaused {
+    pub admin: Address,
+}
+
+/// Emitted when a pauser role is assigned by admin.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PauserSet {
+    pub admin: Address,
+    pub pauser: Address,
+}
+
+/// Emitted when the pauser role is revoked by admin.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PauserRevoked {
+    pub admin: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct EscrowInitialized {
+    pub escrow_id: u64,
+    pub depositor: Address,
+    pub beneficiary: Address,
+    pub amount: i128,
+}
+
+/// Emitted by [`TrustFlow::bump_escrow_ttl`]. `live_until_ledger` is the
+/// watermark the bump was requested up to — the host only actually rewrites
+/// the TTL if the entry was within [`PERSISTENT_LIFETIME_THRESHOLD`] ledgers
+/// of expiring, so the entry's real expiration may already have been further
+/// out than this value if it was bumped recently.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct EscrowTtlBumped {
+    pub escrow_id: u64,
+    pub live_until_ledger: u32,
+}
+
+/// Emitted by [`TrustFlow::bump_juror_stake_ttl`]. Same caveat on
+/// `live_until_ledger` as [`EscrowTtlBumped`].
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct JurorStakeTtlBumped {
+    pub juror: Address,
+    pub live_until_ledger: u32,
+}
+
+/// Emitted by [`TrustFlow::release_milestone_tranche`]. `escrow_id` and
+/// `milestone_index` are carried as indexed topics (not duplicated in the
+/// data payload) so indexers can filter without decoding every event.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct MilestoneTrancheReleased {
+    pub gross_amount: i128,
+    pub treasury_fee: i128,
+    pub beneficiary_payout: i128,
+    pub milestone_released: i128,
+    pub escrow_released: i128,
+    pub beneficiary: Address,
+    pub treasury: Address,
+}
+
+/// Emitted by [`TrustFlow::commit_vote`]. Carries no vote information —
+/// only that this juror has locked in a commitment for this dispute.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct VoteCommitted {
+    pub escrow_id: u64,
+    pub juror: Address,
+}
+
+/// Emitted by [`TrustFlow::reveal_vote`] once a commitment has been
+/// successfully opened.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct VoteRevealed {
+    pub escrow_id: u64,
+    pub juror: Address,
+    pub vote_for_depositor: bool,
+}
+
+/// Emitted by [`TrustFlow::stake`] when a juror adds stake.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct Staked {
+    pub juror: Address,
+    pub amount: i128,
+    pub new_total: i128,
+}
+
+/// Emitted by [`TrustFlow::unstake`] when a juror withdraws stake.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct Unstaked {
+    pub juror: Address,
+    pub amount: i128,
+    pub remaining: i128,
+}
+
+/// Emitted by [`TrustFlow::resolve_dispute`] when a juror on the losing side
+/// is slashed.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct JurorSlashed {
+    pub escrow_id: u64,
+    pub juror: Address,
+    pub slash_amount: i128,
+    pub remaining_stake: i128,
+    pub slash_count: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -40,6 +380,17 @@ pub struct VoteKey {
     pub juror: Address,
 }
 
+/// Composite key identifying a single milestone within an escrow. A separate
+/// struct is needed (rather than a `(u64, u32)` tuple variant) because
+/// contracttype enums only support single-element tuple variants for storage
+/// keys — mirrors the [`VoteKey`] pattern above.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct MilestoneKey {
+    pub escrow_id: u64,
+    pub milestone_index: u32,
+}
+
 #[contracttype]
 pub enum DataKey {
     /// Contract administrator
@@ -50,18 +401,61 @@ pub enum DataKey {
     SlashBps,
     /// Counter for generating unique escrow IDs
     EscrowCounter,
+    /// Global default protocol fee in basis points, admin-configurable via
+    /// `set_fee_bps`. Snapshotted per-escrow at creation time; changing this
+    /// never affects escrows created before the change.
+    FeeBps,
+    /// Global default treasury address fees are paid to. Snapshotted
+    /// per-escrow at creation time alongside `FeeBps`.
+    Treasury,
     /// EscrowRecord keyed by escrow ID
     Escrow(u64),
+    /// Snapshotted fee configuration (treasury + fee_bps) for an escrow,
+    /// captured at creation time and immutable thereafter.
+    EscrowFeeConfig(u64),
+    /// Cumulative gross amount released across all milestone tranches for an
+    /// escrow (i128)
+    EscrowReleased(u64),
+    /// Cumulative gross amount released for a single milestone within an
+    /// escrow (i128)
+    MilestoneReleased(MilestoneKey),
     /// DisputeRecord keyed by escrow ID
     Dispute(u64),
     /// Staked token balance for a juror (i128)
     JurorStake(Address),
-    /// Ordered list of jurors who voted on a dispute (Vec<Address>)
+    /// Ordered list of jurors who *revealed* a vote on a dispute
+    /// (Vec<Address>). Populated by `reveal_vote`, not `commit_vote` — a
+    /// juror who commits but never reveals never appears here, and their
+    /// vote is simply not counted at resolution.
     DisputeVoters(u64),
-    /// A juror's vote direction: true = for depositor, false = for beneficiary
+    /// A juror's committed vote hash for a dispute: `sha256(vote_byte ++
+    /// salt)`, submitted during the commit phase before any votes are
+    /// visible to anyone.
+    JurorCommit(VoteKey),
+    /// A juror's revealed vote direction, set once their commitment has
+    /// been opened: true = for depositor, false = for beneficiary
     JurorVote(VoteKey),
     /// How many times a juror has been slashed (u32)
     JurorSlashCount(Address),
+    /// Whether sensitive contract operations are emergency paused (bool)
+    Paused,
+    /// Granular role: address authorized to trigger emergency pause (Address)
+    Pauser,
+}
+
+/// Helper function that returns `Err(TrustFlowError::ContractPaused)` if the
+/// contract is currently paused.
+fn require_not_paused(env: &Env) -> Result<(), TrustFlowError> {
+    let paused: bool = env
+        .storage()
+        .instance()
+        .get(&DataKey::Paused)
+        .unwrap_or(false);
+    if paused {
+        Err(TrustFlowError::ContractPaused)
+    } else {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -77,6 +471,15 @@ pub enum EscrowStatus {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Milestone {
+    pub label: String,
+    pub amount: i128,
+    pub approved: bool,
+    pub release_time: u32,
+}
+
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct EscrowRecord {
     pub id: u64,
@@ -84,6 +487,7 @@ pub struct EscrowRecord {
     pub beneficiary: Address,
     pub amount: i128,
     pub status: EscrowStatus,
+    pub milestones: Vec<Milestone>,
 }
 
 #[contracttype]
@@ -94,6 +498,21 @@ pub struct DisputeRecord {
     pub reason: String,
     pub resolved: bool,
     pub ruling_for_depositor: bool,
+    /// Ledger sequence number after which `commit_vote` is rejected.
+    pub commit_deadline: u32,
+    /// Ledger sequence number after which `reveal_vote` is rejected, and
+    /// before which `resolve_dispute` is rejected.
+    pub reveal_deadline: u32,
+}
+
+/// Fee configuration snapshotted onto an escrow at creation time. Later
+/// changes to the global `FeeBps`/`Treasury` defaults (via `set_fee_bps`)
+/// never retroactively alter an already-created escrow's snapshot.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowFeeConfig {
+    pub treasury: Address,
+    pub fee_bps: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -109,10 +528,8 @@ impl TrustFlow {
     // Initialisation
     // -----------------------------------------------------------------------
 
-    /// Initialise the contract.  Must be called once before any other function.
-    ///
-    /// * `slash_bps` – basis points deducted from a minority voter's stake
-    ///   each time they are slashed (e.g. `1000` = 10 %).
+    /// Initialise the contract. Must be called once before any other function.
+    /// `slash_bps` are deducted from a minority voter's stake on each slash.
     pub fn initialize(env: Env, admin: Address, token: Address, slash_bps: u32) {
         admin.require_auth();
         if slash_bps > 10_000 {
@@ -122,6 +539,174 @@ impl TrustFlow {
         env.storage().instance().set(&DataKey::Token, &token);
         env.storage().instance().set(&DataKey::SlashBps, &slash_bps);
         env.storage().instance().set(&DataKey::EscrowCounter, &0u64);
+        // Default protocol fee is 50 bps, paid to the admin's address until
+        // `set_treasury` is used to point it elsewhere.
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeBps, &DEFAULT_FEE_BPS);
+        env.storage().instance().set(&DataKey::Treasury, &admin);
+        extend_instance_ttl(&env);
+    }
+
+    /// Admin-only: update the global default protocol fee (bps) used to
+    /// snapshot new escrows. Does not affect already-created escrows.
+    pub fn set_fee_bps(env: Env, caller: Address, fee_bps: u32) -> Result<(), TrustFlowError> {
+        caller.require_auth();
+        extend_instance_ttl(&env);
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != admin {
+            return Err(TrustFlowError::Unauthorized);
+        }
+        if fee_bps > MAX_FEE_BPS {
+            return Err(TrustFlowError::InvalidFeeBps);
+        }
+        env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
+        Ok(())
+    }
+
+    /// Return the current global default protocol fee, in basis points.
+    pub fn get_fee_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::FeeBps)
+            .unwrap_or(DEFAULT_FEE_BPS)
+    }
+
+    /// Return the current global default treasury address.
+    pub fn get_treasury(env: Env) -> Address {
+        env.storage().instance().get(&DataKey::Treasury).unwrap()
+    }
+
+    /// Admin-only: update the global default treasury address used to
+    /// snapshot new escrows. Does not affect already-created escrows.
+    pub fn set_treasury(
+        env: Env,
+        caller: Address,
+        treasury: Address,
+    ) -> Result<(), TrustFlowError> {
+        caller.require_auth();
+        extend_instance_ttl(&env);
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != admin {
+            return Err(TrustFlowError::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::Treasury, &treasury);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Role-Based Emergency Pause & Circuit Breaker
+    // -----------------------------------------------------------------------
+
+    /// Admin-only: grant the pause-only role to `pauser`.
+    ///
+    /// The pauser address can call [`pause`] to trigger a circuit breaker in an
+    /// emergency, but cannot call [`unpause`].
+    pub fn set_pauser(env: Env, caller: Address, pauser: Address) -> Result<(), TrustFlowError> {
+        caller.require_auth();
+        extend_instance_ttl(&env);
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != admin {
+            return Err(TrustFlowError::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::Pauser, &pauser);
+        env.events().publish(
+            (symbol_short!("pauser"), symbol_short!("set")),
+            PauserSet {
+                admin: caller,
+                pauser,
+            },
+        );
+        Ok(())
+    }
+
+    /// Admin-only: revoke the pauser role.
+    pub fn revoke_pauser(env: Env, caller: Address) -> Result<(), TrustFlowError> {
+        caller.require_auth();
+        extend_instance_ttl(&env);
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != admin {
+            return Err(TrustFlowError::Unauthorized);
+        }
+        env.storage().instance().remove(&DataKey::Pauser);
+        env.events().publish(
+            (symbol_short!("pauser"), symbol_short!("revoke")),
+            PauserRevoked { admin: caller },
+        );
+        Ok(())
+    }
+
+    /// Return the current pauser address, if set.
+    pub fn get_pauser(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Pauser)
+    }
+
+    /// Emergency pause the contract. Callable by Admin OR Pauser role.
+    ///
+    /// Halts all sensitive state-mutating entrypoints immediately.
+    pub fn pause(env: Env, caller: Address) -> Result<(), TrustFlowError> {
+        caller.require_auth();
+        extend_instance_ttl(&env);
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let pauser: Option<Address> = env.storage().instance().get(&DataKey::Pauser);
+
+        let is_admin = caller == admin;
+        let is_pauser = pauser.map_or(false, |p| caller == p);
+
+        if !is_admin && !is_pauser {
+            return Err(TrustFlowError::Unauthorized);
+        }
+
+        let currently_paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
+
+        if !currently_paused {
+            env.storage().instance().set(&DataKey::Paused, &true);
+            env.events().publish(
+                (symbol_short!("circuit"), symbol_short!("pause")),
+                ContractPaused { caller },
+            );
+        }
+        Ok(())
+    }
+
+    /// Resume normal contract operations. Admin-only.
+    ///
+    /// The Pauser role cannot call this function — only the Admin can resume
+    /// operations after an incident investigation.
+    pub fn unpause(env: Env, caller: Address) -> Result<(), TrustFlowError> {
+        caller.require_auth();
+        extend_instance_ttl(&env);
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != admin {
+            return Err(TrustFlowError::Unauthorized);
+        }
+
+        let currently_paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
+
+        if currently_paused {
+            env.storage().instance().set(&DataKey::Paused, &false);
+            env.events().publish(
+                (symbol_short!("circuit"), symbol_short!("unpause")),
+                ContractUnpaused { admin: caller },
+            );
+        }
+        Ok(())
+    }
+
+    /// Return whether the contract is currently emergency paused.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
     }
 
     // -----------------------------------------------------------------------
@@ -131,39 +716,61 @@ impl TrustFlow {
     /// Stake `amount` tokens.  Transfers tokens from `juror` to this contract.
     pub fn stake(env: Env, juror: Address, amount: i128) -> Result<(), TrustFlowError> {
         juror.require_auth();
+        extend_instance_ttl(&env);
+        require_not_paused(&env)?;
         if amount <= 0 {
             return Err(TrustFlowError::InvalidAmount);
         }
         let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         token::Client::new(&env, &token).transfer(&juror, &env.current_contract_address(), &amount);
 
-        let prev: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::JurorStake(juror.clone()))
-            .unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&DataKey::JurorStake(juror), &(prev + amount));
+        let key = DataKey::JurorStake(juror.clone());
+        let prev: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        let new_total = prev
+            .checked_add(amount)
+            .ok_or(TrustFlowError::ArithmeticOverflow)?;
+        env.storage().persistent().set(&key, &new_total);
+        extend_persistent_ttl(&env, &key);
+
+        env.events().publish(
+            (symbol_short!("stake"), symbol_short!("staked")),
+            Staked {
+                juror,
+                amount,
+                new_total,
+            },
+        );
+
         Ok(())
     }
 
     /// Withdraw `amount` tokens that have not been slashed.
     pub fn unstake(env: Env, juror: Address, amount: i128) -> Result<(), TrustFlowError> {
         juror.require_auth();
-        let current: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::JurorStake(juror.clone()))
-            .unwrap_or(0);
+        extend_instance_ttl(&env);
+        require_not_paused(&env)?;
+        let key = DataKey::JurorStake(juror.clone());
+        let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
         if current < amount {
             return Err(TrustFlowError::InsufficientStake);
         }
         let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         token::Client::new(&env, &token).transfer(&env.current_contract_address(), &juror, &amount);
-        env.storage()
-            .persistent()
-            .set(&DataKey::JurorStake(juror), &(current - amount));
+        let remaining = current
+            .checked_sub(amount)
+            .ok_or(TrustFlowError::ArithmeticOverflow)?;
+        env.storage().persistent().set(&key, &remaining);
+        extend_persistent_ttl(&env, &key);
+
+        env.events().publish(
+            (symbol_short!("stake"), symbol_short!("unstaked")),
+            Unstaked {
+                juror,
+                amount,
+                remaining,
+            },
+        );
+
         Ok(())
     }
 
@@ -183,6 +790,38 @@ impl TrustFlow {
             .unwrap_or(0)
     }
 
+    /// Extend the TTL of a juror's stake/slash-count storage. Callable by
+    /// anyone. Errors if the juror has no stake on record.
+    pub fn bump_juror_stake_ttl(env: Env, juror: Address) -> Result<u32, TrustFlowError> {
+        // A juror may stay staked for a long time between disputes; without
+        // periodic maintenance their stake entry could archive and, on the
+        // next dispute they are drawn into, `resolve_dispute` would be
+        // unable to read or slash it. Returns the ledger sequence up to
+        // which the stake is now guaranteed to live.
+        let stake_key = DataKey::JurorStake(juror.clone());
+        if !env.storage().persistent().has(&stake_key) {
+            return Err(TrustFlowError::JurorStakeNotFound);
+        }
+
+        extend_instance_ttl(&env);
+        extend_persistent_ttl(&env, &stake_key);
+        extend_persistent_ttl(&env, &DataKey::JurorSlashCount(juror.clone()));
+
+        let live_until_ledger = env
+            .ledger()
+            .sequence()
+            .saturating_add(PERSISTENT_BUMP_AMOUNT);
+        env.events().publish(
+            (symbol_short!("juror"), symbol_short!("ttlbump")),
+            JurorStakeTtlBumped {
+                juror,
+                live_until_ledger,
+            },
+        );
+
+        Ok(live_until_ledger)
+    }
+
     // -----------------------------------------------------------------------
     // Escrow lifecycle
     // -----------------------------------------------------------------------
@@ -196,6 +835,8 @@ impl TrustFlow {
         amount: i128,
     ) -> Result<u64, TrustFlowError> {
         depositor.require_auth();
+        extend_instance_ttl(&env);
+        require_not_paused(&env)?;
         if amount <= 0 {
             return Err(TrustFlowError::InvalidAmount);
         }
@@ -211,20 +852,248 @@ impl TrustFlow {
             .instance()
             .get(&DataKey::EscrowCounter)
             .unwrap_or(0);
-        let id = counter + 1;
+        let id = counter
+            .checked_add(1)
+            .ok_or(TrustFlowError::ArithmeticOverflow)?;
         env.storage().instance().set(&DataKey::EscrowCounter, &id);
 
+        let escrow_key = DataKey::Escrow(id);
         env.storage().persistent().set(
-            &DataKey::Escrow(id),
+            &escrow_key,
             &EscrowRecord {
                 id,
                 depositor,
                 beneficiary,
                 amount,
                 status: EscrowStatus::Active,
+                milestones: Vec::new(&env),
             },
         );
+        extend_persistent_ttl(&env, &escrow_key);
+        snapshot_fee_config(&env, id);
         Ok(id)
+    }
+
+    /// Initialise an escrow with specific milestones and lock `amount` tokens.
+    pub fn init_escrow(
+        env: Env,
+        depositor: Address,
+        beneficiary: Address,
+        milestones: Vec<Milestone>,
+    ) -> Result<u64, TrustFlowError> {
+        depositor.require_auth();
+        extend_instance_ttl(&env);
+        require_not_paused(&env)?;
+
+        let mut total_amount: i128 = 0;
+        for m in milestones.iter() {
+            if m.amount <= 0 {
+                return Err(TrustFlowError::InvalidAmount);
+            }
+            total_amount = total_amount
+                .checked_add(m.amount)
+                .ok_or(TrustFlowError::ArithmeticOverflow)?;
+        }
+
+        if total_amount <= 0 {
+            return Err(TrustFlowError::InvalidAmount);
+        }
+
+        let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        token::Client::new(&env, &token).transfer(
+            &depositor,
+            &env.current_contract_address(),
+            &total_amount,
+        );
+
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowCounter)
+            .unwrap_or(0);
+        let id = counter
+            .checked_add(1)
+            .ok_or(TrustFlowError::ArithmeticOverflow)?;
+        env.storage().instance().set(&DataKey::EscrowCounter, &id);
+
+        let escrow_key = DataKey::Escrow(id);
+        env.storage().persistent().set(
+            &escrow_key,
+            &EscrowRecord {
+                id,
+                depositor: depositor.clone(),
+                beneficiary: beneficiary.clone(),
+                amount: total_amount,
+                status: EscrowStatus::Active,
+                milestones,
+            },
+        );
+        extend_persistent_ttl(&env, &escrow_key);
+        snapshot_fee_config(&env, id);
+
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("init")),
+            EscrowInitialized {
+                escrow_id: id,
+                depositor,
+                beneficiary,
+                amount: total_amount,
+            },
+        );
+
+        Ok(id)
+    }
+
+    /// Release a `gross_amount` tranche of a milestone to its beneficiary,
+    /// splitting the escrow's snapshotted fee to its snapshotted treasury
+    /// atomically. Caller must be the depositor. May be called repeatedly
+    /// per milestone; settles the escrow once fully released.
+    pub fn release_milestone_tranche(
+        env: Env,
+        escrow_id: u64,
+        milestone_index: u32,
+        gross_amount: i128,
+        caller: Address,
+    ) -> Result<(), TrustFlowError> {
+        // Each tranche is charged exactly
+        // cumulative_fee(escrow_released_after) - cumulative_fee(escrow_released_before),
+        // which guarantees splitting one release into many tranches never
+        // changes the total fee collected across the whole escrow (see
+        // `cumulative_fee`). All validation and storage accounting happens
+        // before either token transfer, and both transfers happen in this
+        // same invocation -- if either fails, Soroban rolls back the whole
+        // call, so there is no way to end up with mismatched books.
+        caller.require_auth();
+        extend_instance_ttl(&env);
+        require_not_paused(&env)?;
+
+        if gross_amount <= 0 {
+            return Err(TrustFlowError::InvalidAmount);
+        }
+
+        let escrow_key = DataKey::Escrow(escrow_id);
+        let mut escrow: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&escrow_key)
+            .ok_or(TrustFlowError::EscrowNotFound)?;
+
+        if caller != escrow.depositor {
+            return Err(TrustFlowError::Unauthorized);
+        }
+        if escrow.status != EscrowStatus::Active {
+            return Err(TrustFlowError::InvalidState);
+        }
+
+        let mut milestone = escrow
+            .milestones
+            .get(milestone_index)
+            .ok_or(TrustFlowError::MilestoneNotFound)?;
+
+        // Time-lock check: milestone cannot be claimed before its release_time
+        let current_ledger = env.ledger().sequence();
+        if current_ledger < milestone.release_time {
+            return Err(TrustFlowError::MilestoneTimeLocked);
+        }
+
+        let milestone_key = DataKey::MilestoneReleased(MilestoneKey {
+            escrow_id,
+            milestone_index,
+        });
+        let milestone_released_before: i128 =
+            env.storage().persistent().get(&milestone_key).unwrap_or(0);
+        let milestone_released_after = milestone_released_before
+            .checked_add(gross_amount)
+            .ok_or(TrustFlowError::InvalidAmount)?;
+        if milestone_released_after > milestone.amount {
+            return Err(TrustFlowError::MilestoneAmountMismatch);
+        }
+
+        let released_key = DataKey::EscrowReleased(escrow_id);
+        let escrow_released_before: i128 =
+            env.storage().persistent().get(&released_key).unwrap_or(0);
+        let escrow_released_after = escrow_released_before
+            .checked_add(gross_amount)
+            .ok_or(TrustFlowError::InvalidAmount)?;
+        if escrow_released_after > escrow.amount {
+            return Err(TrustFlowError::MilestoneAmountMismatch);
+        }
+
+        let fee_config_key = DataKey::EscrowFeeConfig(escrow_id);
+        let fee_config: EscrowFeeConfig = env
+            .storage()
+            .persistent()
+            .get(&fee_config_key)
+            .ok_or(TrustFlowError::EscrowNotFound)?;
+        extend_persistent_ttl(&env, &fee_config_key);
+
+        let fee_before = cumulative_fee(escrow_released_before, fee_config.fee_bps)?;
+        let fee_after = cumulative_fee(escrow_released_after, fee_config.fee_bps)?;
+        let treasury_fee = fee_after
+            .checked_sub(fee_before)
+            .ok_or(TrustFlowError::InvalidAmount)?;
+        let beneficiary_payout = gross_amount
+            .checked_sub(treasury_fee)
+            .ok_or(TrustFlowError::InvalidAmount)?;
+
+        // -- All validation done; persist accounting before any transfer. --
+
+        milestone.approved = true;
+        escrow.milestones.set(milestone_index, milestone);
+        if escrow_released_after == escrow.amount {
+            escrow.status = EscrowStatus::Settled;
+        }
+        env.storage().persistent().set(&escrow_key, &escrow);
+        extend_persistent_ttl(&env, &escrow_key);
+
+        env.storage()
+            .persistent()
+            .set(&milestone_key, &milestone_released_after);
+        extend_persistent_ttl(&env, &milestone_key);
+
+        env.storage()
+            .persistent()
+            .set(&released_key, &escrow_released_after);
+        extend_persistent_ttl(&env, &released_key);
+
+        // -- Accounting is durable; now move the tokens. --
+
+        let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        let contract_address = env.current_contract_address();
+        try_token_transfer(
+            &env,
+            &token,
+            &contract_address,
+            &escrow.beneficiary,
+            beneficiary_payout,
+        )?;
+        try_token_transfer(
+            &env,
+            &token,
+            &contract_address,
+            &fee_config.treasury,
+            treasury_fee,
+        )?;
+
+        env.events().publish(
+            (
+                symbol_short!("mstone"),
+                symbol_short!("release"),
+                escrow_id,
+                milestone_index,
+            ),
+            MilestoneTrancheReleased {
+                gross_amount,
+                treasury_fee,
+                beneficiary_payout,
+                milestone_released: milestone_released_after,
+                escrow_released: escrow_released_after,
+                beneficiary: escrow.beneficiary,
+                treasury: fee_config.treasury,
+            },
+        );
+
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -240,10 +1109,13 @@ impl TrustFlow {
         reason: String,
     ) -> Result<(), TrustFlowError> {
         caller.require_auth();
+        extend_instance_ttl(&env);
+        require_not_paused(&env)?;
+        let escrow_key = DataKey::Escrow(escrow_id);
         let mut escrow: EscrowRecord = env
             .storage()
             .persistent()
-            .get(&DataKey::Escrow(escrow_id))
+            .get(&escrow_key)
             .ok_or(TrustFlowError::EscrowNotFound)?;
 
         if escrow.status != EscrowStatus::Active {
@@ -254,34 +1126,60 @@ impl TrustFlow {
         }
 
         escrow.status = EscrowStatus::Disputed;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Escrow(escrow_id), &escrow);
+        env.storage().persistent().set(&escrow_key, &escrow);
+        extend_persistent_ttl(&env, &escrow_key);
+
+        // Dispute settlement depends on the cumulative released amount.
+        // Keep it alive whenever the escrow is refreshed on dispute entry.
+        extend_persistent_ttl(&env, &DataKey::EscrowReleased(escrow_id));
+
+        let now = env.ledger().sequence();
+        let commit_deadline = now.saturating_add(COMMIT_WINDOW_LEDGERS);
+        let reveal_deadline = commit_deadline.saturating_add(REVEAL_WINDOW_LEDGERS);
+
+        let dispute_key = DataKey::Dispute(escrow_id);
         env.storage().persistent().set(
-            &DataKey::Dispute(escrow_id),
+            &dispute_key,
             &DisputeRecord {
                 escrow_id,
                 raised_by: caller,
                 reason,
                 resolved: false,
                 ruling_for_depositor: false,
+                commit_deadline,
+                reveal_deadline,
             },
         );
+        extend_persistent_ttl(&env, &dispute_key);
         Ok(())
     }
 
-    /// Cast a vote on an open dispute.  The calling juror must have a positive
-    /// stake balance before voting.
+    /// Commit to a vote on an open dispute, without revealing it.
     ///
-    /// * `vote_for_depositor` – `true` rules in favour of the depositor;
-    ///   `false` rules in favour of the beneficiary.
-    pub fn cast_vote(
+    /// The calling juror must have a positive stake balance. `commitment`
+    /// must be `sha256(vote_byte ++ salt)` — callers compute this off-chain
+    /// (or via [`TrustFlow::hash_vote`] in tests) and keep `vote` and `salt`
+    /// secret until the reveal phase. Only callable before the dispute's
+    /// commit window closes.
+    ///
+    /// **Hash preimage format** (for integrators building commitments
+    /// off-chain):
+    /// - `vote_byte`: `0x01` if voting for the depositor, `0x00` if voting
+    ///   for the beneficiary (single byte).
+    /// - `salt`: exactly 32 bytes of caller-chosen randomness (the
+    ///   [`BytesN<32>`] type enforces this length on-chain; off-chain
+    ///   tooling must pad or generate 32 bytes).
+    /// - The preimage is the concatenation `[vote_byte, salt[0], salt[1],
+    ///   ..., salt[31]]` (33 bytes total), hashed with SHA-256.
+    pub fn commit_vote(
         env: Env,
         escrow_id: u64,
         juror: Address,
-        vote_for_depositor: bool,
+        commitment: BytesN<32>,
     ) -> Result<(), TrustFlowError> {
         juror.require_auth();
+        extend_instance_ttl(&env);
+        require_not_paused(&env)?;
 
         let stake: i128 = env
             .storage()
@@ -292,40 +1190,135 @@ impl TrustFlow {
             return Err(TrustFlowError::InsufficientStake);
         }
 
+        let dispute_key = DataKey::Dispute(escrow_id);
         let dispute: DisputeRecord = env
             .storage()
             .persistent()
-            .get(&DataKey::Dispute(escrow_id))
+            .get(&dispute_key)
             .ok_or(TrustFlowError::DisputeNotFound)?;
         if dispute.resolved {
             return Err(TrustFlowError::DisputeAlreadyResolved);
         }
+        if env.ledger().sequence() >= dispute.commit_deadline {
+            return Err(TrustFlowError::CommitPhaseEnded);
+        }
 
-        let vote_key = VoteKey {
+        let commit_key = DataKey::JurorCommit(VoteKey {
             escrow_id,
             juror: juror.clone(),
-        };
-        if env
+        });
+        if env.storage().persistent().has(&commit_key) {
+            return Err(TrustFlowError::AlreadyCommitted);
+        }
+
+        env.storage().persistent().set(&commit_key, &commitment);
+        extend_persistent_ttl(&env, &commit_key);
+        extend_persistent_ttl(&env, &dispute_key);
+
+        env.events().publish(
+            (symbol_short!("vote"), symbol_short!("commit")),
+            VoteCommitted { escrow_id, juror },
+        );
+
+        Ok(())
+    }
+
+    /// Reveal a previously committed vote. Only callable once the dispute's
+    /// commit window has closed and before its reveal window closes; the
+    /// revealed `(vote_for_depositor, salt)` pair must hash to the juror's
+    /// stored commitment.
+    ///
+    /// After a successful reveal the stored commitment is cleared to free
+    /// storage and prevent accidental reuse; the vote itself is recorded
+    /// under [`DataKey::JurorVote`] and the juror is appended to the
+    /// dispute's voter list.
+    ///
+    /// Replay protection: a second call for the same `(escrow_id, juror)`
+    /// is rejected with [`TrustFlowError::AlreadyVoted`] because the
+    /// [`DataKey::JurorVote`] entry already exists.
+    ///
+    /// * `vote_for_depositor` – `true` rules in favour of the depositor;
+    ///   `false` rules in favour of the beneficiary.
+    /// * `salt` – the exact 32-byte salt used when computing the
+    ///   commitment. Must match the preimage documented in
+    ///   [`TrustFlow::commit_vote`].
+    pub fn reveal_vote(
+        env: Env,
+        escrow_id: u64,
+        juror: Address,
+        vote_for_depositor: bool,
+        salt: BytesN<32>,
+    ) -> Result<(), TrustFlowError> {
+        juror.require_auth();
+        extend_instance_ttl(&env);
+        require_not_paused(&env)?;
+
+        let dispute_key = DataKey::Dispute(escrow_id);
+        let dispute: DisputeRecord = env
             .storage()
             .persistent()
-            .has(&DataKey::JurorVote(vote_key.clone()))
-        {
+            .get(&dispute_key)
+            .ok_or(TrustFlowError::DisputeNotFound)?;
+        if dispute.resolved {
+            return Err(TrustFlowError::DisputeAlreadyResolved);
+        }
+        let now = env.ledger().sequence();
+        if now < dispute.commit_deadline || now >= dispute.reveal_deadline {
+            return Err(TrustFlowError::RevealPhaseNotOpen);
+        }
+
+        // Check AlreadyVoted before NoCommitFound: after a successful
+        // reveal the commitment is cleared, so a duplicate reveal would
+        // otherwise surface the wrong error.
+        let vote_key = DataKey::JurorVote(VoteKey {
+            escrow_id,
+            juror: juror.clone(),
+        });
+        if env.storage().persistent().has(&vote_key) {
             return Err(TrustFlowError::AlreadyVoted);
+        }
+
+        let commit_key = DataKey::JurorCommit(VoteKey {
+            escrow_id,
+            juror: juror.clone(),
+        });
+        let commitment: BytesN<32> = env
+            .storage()
+            .persistent()
+            .get(&commit_key)
+            .ok_or(TrustFlowError::NoCommitFound)?;
+
+        if hash_vote(&env, vote_for_depositor, &salt) != commitment {
+            return Err(TrustFlowError::InvalidReveal);
         }
 
         env.storage()
             .persistent()
-            .set(&DataKey::JurorVote(vote_key), &vote_for_depositor);
+            .set(&vote_key, &vote_for_depositor);
+        extend_persistent_ttl(&env, &vote_key);
 
+        // Clear the commitment to free storage and prevent accidental reuse.
+        env.storage().persistent().remove(&commit_key);
+
+        let voters_key = DataKey::DisputeVoters(escrow_id);
         let mut voters: Vec<Address> = env
             .storage()
             .persistent()
-            .get(&DataKey::DisputeVoters(escrow_id))
-            .unwrap_or_else(|| vec![&env]);
-        voters.push_back(juror);
-        env.storage()
-            .persistent()
-            .set(&DataKey::DisputeVoters(escrow_id), &voters);
+            .get(&voters_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        voters.push_back(juror.clone());
+        env.storage().persistent().set(&voters_key, &voters);
+        extend_persistent_ttl(&env, &voters_key);
+        extend_persistent_ttl(&env, &dispute_key);
+
+        env.events().publish(
+            (symbol_short!("vote"), symbol_short!("reveal")),
+            VoteRevealed {
+                escrow_id,
+                juror,
+                vote_for_depositor,
+            },
+        );
 
         Ok(())
     }
@@ -339,20 +1332,26 @@ impl TrustFlow {
     ///
     /// Returns `true` if the ruling is for the depositor, `false` otherwise.
     pub fn resolve_dispute(env: Env, escrow_id: u64) -> Result<bool, TrustFlowError> {
+        extend_instance_ttl(&env);
+        require_not_paused(&env)?;
+        let dispute_key = DataKey::Dispute(escrow_id);
         let mut dispute: DisputeRecord = env
             .storage()
             .persistent()
-            .get(&DataKey::Dispute(escrow_id))
+            .get(&dispute_key)
             .ok_or(TrustFlowError::DisputeNotFound)?;
         if dispute.resolved {
             return Err(TrustFlowError::DisputeAlreadyResolved);
+        }
+        if env.ledger().sequence() < dispute.reveal_deadline {
+            return Err(TrustFlowError::RevealPhaseNotEnded);
         }
 
         let voters: Vec<Address> = env
             .storage()
             .persistent()
             .get(&DataKey::DisputeVoters(escrow_id))
-            .unwrap_or_else(|| vec![&env]);
+            .unwrap_or_else(|| Vec::new(&env));
         if voters.is_empty() {
             return Err(TrustFlowError::NoVotesCast);
         }
@@ -370,9 +1369,13 @@ impl TrustFlow {
                 }))
                 .unwrap_or(false);
             if vote {
-                for_depositor += 1;
+                for_depositor = for_depositor
+                    .checked_add(1)
+                    .ok_or(TrustFlowError::ArithmeticOverflow)?;
             } else {
-                for_beneficiary += 1;
+                for_beneficiary = for_beneficiary
+                    .checked_add(1)
+                    .ok_or(TrustFlowError::ArithmeticOverflow)?;
             }
         }
 
@@ -397,62 +1400,179 @@ impl TrustFlow {
                 .unwrap_or(false);
 
             if vote != ruling {
-                let stake: i128 = env
-                    .storage()
-                    .persistent()
-                    .get(&DataKey::JurorStake(voter.clone()))
-                    .unwrap_or(0);
-                // slash_amount = stake * slash_bps / 10_000, saturating at stake
-                let slash = stake
-                    .checked_mul(slash_bps as i128)
-                    .unwrap_or(stake * DEFAULT_SLASH_BPS as i128)
-                    .checked_div(10_000)
-                    .unwrap_or(0)
-                    .min(stake);
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::JurorStake(voter.clone()), &(stake - slash));
+                let stake_key = DataKey::JurorStake(voter.clone());
+                let stake: i128 = env.storage().persistent().get(&stake_key).unwrap_or(0);
+                // slash_amount = stake * slash_bps / 10_000, capped at stake.
+                //
+                // Three-tier safe arithmetic:
+                //   1. Try i128 checked_mul (fast path, covers typical values).
+                //   2. Widen to u128 for stakes up to ~3.4e35 with bps up to
+                //      ~10_000 (covers virtually all realistic values).
+                //   3. If even u128 overflows, divide first then multiply —
+                //      this truncates early but guarantees no overflow for any
+                //      stake/bps combination that fits in i128.
+                let slash: i128 = {
+                    let stake_u128 = stake as u128;
+                    let bps_u128 = slash_bps as u128;
+                    let slash_u128 = stake
+                        .checked_mul(slash_bps as i128)
+                        .and_then(|v| v.checked_div(10_000))
+                        .map(|v| v as u128)
+                        .or_else(|| {
+                            // i128 overflow — try u128
+                            stake_u128
+                                .checked_mul(bps_u128)
+                                .and_then(|v| v.checked_div(10_000))
+                                .or_else(|| {
+                                    // u128 overflow too — divide first
+                                    stake_u128
+                                        .checked_div(10_000)
+                                        .map(|q| q.saturating_mul(bps_u128))
+                                })
+                        })
+                        .unwrap_or(stake_u128)
+                        .min(stake_u128);
+                    slash_u128 as i128
+                };
 
+                let remaining_stake = stake
+                    .checked_sub(slash)
+                    .ok_or(TrustFlowError::ArithmeticOverflow)?;
+                env.storage().persistent().set(&stake_key, &remaining_stake);
+                extend_persistent_ttl(&env, &stake_key);
+
+                let slash_count_key = DataKey::JurorSlashCount(voter.clone());
                 let count: u32 = env
                     .storage()
                     .persistent()
-                    .get(&DataKey::JurorSlashCount(voter.clone()))
+                    .get(&slash_count_key)
                     .unwrap_or(0);
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::JurorSlashCount(voter.clone()), &(count + 1));
+                let new_count = count
+                    .checked_add(1)
+                    .ok_or(TrustFlowError::ArithmeticOverflow)?;
+                env.storage().persistent().set(&slash_count_key, &new_count);
+                extend_persistent_ttl(&env, &slash_count_key);
+
+                env.events().publish(
+                    (symbol_short!("slash"), symbol_short!("slashed")),
+                    JurorSlashed {
+                        escrow_id,
+                        juror: voter,
+                        slash_amount: slash,
+                        remaining_stake,
+                        slash_count: new_count,
+                    },
+                );
             }
         }
 
         // Finalise dispute
         dispute.resolved = true;
         dispute.ruling_for_depositor = ruling;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Dispute(escrow_id), &dispute);
+        env.storage().persistent().set(&dispute_key, &dispute);
+        extend_persistent_ttl(&env, &dispute_key);
 
-        // Settle escrow funds
+        // Settle escrow funds. Any milestone tranches already released via
+        // `release_milestone_tranche` before the dispute was raised have
+        // already left the contract, so only the amount still locked
+        // (escrow.amount - cumulative released) is transferred here. When no
+        // partial release has occurred `released` is 0 and this transfers
+        // the full `escrow.amount`, matching prior behavior exactly.
+        let escrow_key = DataKey::Escrow(escrow_id);
         let mut escrow: EscrowRecord = env
             .storage()
             .persistent()
-            .get(&DataKey::Escrow(escrow_id))
+            .get(&escrow_key)
             .ok_or(TrustFlowError::EscrowNotFound)?;
         let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         let token_client = token::Client::new(&env, &token);
+
+        let released: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowReleased(escrow_id))
+            .unwrap_or(0);
+        let remaining = escrow
+            .amount
+            .checked_sub(released)
+            .ok_or(TrustFlowError::ArithmeticOverflow)?;
 
         let recipient = if ruling {
             escrow.depositor.clone()
         } else {
             escrow.beneficiary.clone()
         };
-        token_client.transfer(&env.current_contract_address(), &recipient, &escrow.amount);
+        if remaining > 0 {
+            token_client.transfer(&env.current_contract_address(), &recipient, &remaining);
+        }
 
         escrow.status = EscrowStatus::Settled;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Escrow(escrow_id), &escrow);
+        env.storage().persistent().set(&escrow_key, &escrow);
+        extend_persistent_ttl(&env, &escrow_key);
 
         Ok(ruling)
+    }
+
+    // -----------------------------------------------------------------------
+    // State archival / TTL maintenance
+    // -----------------------------------------------------------------------
+
+    /// Extend the TTL of an escrow's persistent storage (and its dispute
+    /// records, if any) so it survives long periods of inactivity without
+    /// being archived. Callable by anyone — e.g. a keeper/cron job — since it
+    /// only pays for rent and cannot mutate escrow state or funds.
+    ///
+    /// Returns the ledger sequence up to which the escrow's storage is now
+    /// guaranteed to live.
+    pub fn bump_escrow_ttl(env: Env, escrow_id: u64) -> Result<u32, TrustFlowError> {
+        let escrow_key = DataKey::Escrow(escrow_id);
+        let escrow: EscrowRecord = env
+            .storage()
+            .persistent()
+            .get(&escrow_key)
+            .ok_or(TrustFlowError::EscrowNotFound)?;
+
+        extend_instance_ttl(&env);
+        extend_persistent_ttl(&env, &escrow_key);
+
+        // Milestone-release accounting introduced alongside partial
+        // settlement: the fee snapshot, the escrow-wide released counter,
+        // and each milestone's own released counter all need to survive as
+        // long as the escrow itself does.
+        extend_persistent_ttl(&env, &DataKey::EscrowFeeConfig(escrow_id));
+        extend_persistent_ttl(&env, &DataKey::EscrowReleased(escrow_id));
+        for (index, _) in escrow.milestones.iter().enumerate() {
+            extend_persistent_ttl(
+                &env,
+                &DataKey::MilestoneReleased(MilestoneKey {
+                    escrow_id,
+                    milestone_index: index as u32,
+                }),
+            );
+        }
+
+        let dispute_key = DataKey::Dispute(escrow_id);
+        if env.storage().persistent().has(&dispute_key) {
+            extend_persistent_ttl(&env, &dispute_key);
+            let voters_key = DataKey::DisputeVoters(escrow_id);
+            if env.storage().persistent().has(&voters_key) {
+                extend_persistent_ttl(&env, &voters_key);
+            }
+        }
+
+        let live_until_ledger = env
+            .ledger()
+            .sequence()
+            .saturating_add(PERSISTENT_BUMP_AMOUNT);
+        env.events().publish(
+            (symbol_short!("escrow"), symbol_short!("ttlbump")),
+            EscrowTtlBumped {
+                escrow_id,
+                live_until_ledger,
+            },
+        );
+
+        Ok(live_until_ledger)
     }
 }
 
@@ -463,7 +1583,10 @@ impl TrustFlow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, token, Address, Env, String};
+    use soroban_sdk::{
+        testutils::{Address as _, Events as _, Ledger as _},
+        token, Address, Env, IntoVal, String, TryFromVal,
+    };
 
     // -----------------------------------------------------------------------
     // Helpers
@@ -496,6 +1619,74 @@ mod tests {
         token::Client::new(env, token_addr).balance(addr)
     }
 
+    // The four helpers below read contract storage directly (via
+    // `env.as_contract`) rather than through public getters — the contract
+    // intentionally exposes no `get_escrow`/`get_escrow_fee_config`/
+    // `get_milestone_released`/`get_escrow_released` entrypoints, to keep
+    // its public ABI (and on-chain spec) minimal.
+
+    fn read_escrow(env: &Env, contract_id: &Address, escrow_id: u64) -> EscrowRecord {
+        env.as_contract(contract_id, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::Escrow(escrow_id))
+                .unwrap()
+        })
+    }
+
+    fn read_escrow_fee_config(env: &Env, contract_id: &Address, escrow_id: u64) -> EscrowFeeConfig {
+        env.as_contract(contract_id, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::EscrowFeeConfig(escrow_id))
+                .unwrap()
+        })
+    }
+
+    fn read_milestone_released(
+        env: &Env,
+        contract_id: &Address,
+        escrow_id: u64,
+        milestone_index: u32,
+    ) -> i128 {
+        env.as_contract(contract_id, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::MilestoneReleased(MilestoneKey {
+                    escrow_id,
+                    milestone_index,
+                }))
+                .unwrap_or(0)
+        })
+    }
+
+    fn read_dispute(env: &Env, contract_id: &Address, escrow_id: u64) -> DisputeRecord {
+        env.as_contract(contract_id, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::Dispute(escrow_id))
+                .unwrap()
+        })
+    }
+
+    fn read_escrow_released(env: &Env, contract_id: &Address, escrow_id: u64) -> i128 {
+        env.as_contract(contract_id, || {
+            env.storage()
+                .persistent()
+                .get(&DataKey::EscrowReleased(escrow_id))
+                .unwrap_or(0)
+        })
+    }
+
+    /// A fixed salt used across tests. Commit-reveal secrecy only needs to
+    /// hold between commit and reveal within a single dispute — reusing the
+    /// same salt across independent test disputes doesn't weaken anything
+    /// being tested here, since each commitment is still scoped to its own
+    /// `(escrow_id, juror)` storage slot.
+    fn test_salt(env: &Env) -> BytesN<32> {
+        BytesN::from_array(env, &[7u8; 32])
+    }
+
     fn dispute_round(
         env: &Env,
         client: &TrustFlowClient,
@@ -508,7 +1699,7 @@ mod tests {
         let depositor = Address::random(env);
         let beneficiary = Address::random(env);
 
-        mint(sac, &depositor, 1_000);
+        mint(&sac, &depositor, 1_000);
         let escrow_id = client.create_escrow(&depositor, &beneficiary, &1_000);
 
         client.raise_dispute(
@@ -517,12 +1708,27 @@ mod tests {
             &String::from_slice(env, "test dispute"),
         );
 
-        // Majority (honest jurors) votes for depositor
+        let salt = test_salt(env);
+
+        // Commit phase: majority (honest jurors) commit to vote for
+        // depositor; the malicious juror commits to vote with the minority.
+        let honest_commitment = hash_vote(env, true, &salt);
         for j in honest_jurors {
-            client.cast_vote(&escrow_id, j, &true);
+            client.commit_vote(&escrow_id, j, &honest_commitment);
         }
-        // Malicious juror votes with minority (against depositor)
-        client.cast_vote(&escrow_id, malicious_juror, &false);
+        let malicious_commitment = hash_vote(env, false, &salt);
+        client.commit_vote(&escrow_id, malicious_juror, &malicious_commitment);
+
+        // Move past the commit window into the reveal window.
+        advance_ledger(env, COMMIT_WINDOW_LEDGERS);
+
+        for j in honest_jurors {
+            client.reveal_vote(&escrow_id, j, &true, &salt);
+        }
+        client.reveal_vote(&escrow_id, malicious_juror, &false, &salt);
+
+        // Move past the reveal window so `resolve_dispute` is callable.
+        advance_ledger(env, REVEAL_WINDOW_LEDGERS);
 
         client.resolve_dispute(&escrow_id);
         escrow_id
@@ -561,7 +1767,7 @@ mod tests {
         client.stake(&juror, &100);
 
         let result = client.try_unstake(&juror, &200);
-        assert!(result.is_err());
+        assert_eq!(result, Err(Ok(TrustFlowError::InsufficientStake)));
     }
 
     #[test]
@@ -573,7 +1779,7 @@ mod tests {
         let juror = Address::random(&env);
 
         let result = client.try_stake(&juror, &0);
-        assert!(result.is_err());
+        assert_eq!(result, Err(Ok(TrustFlowError::InvalidAmount)));
     }
 
     // -----------------------------------------------------------------------
@@ -581,7 +1787,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_cast_vote_requires_stake() {
+    fn test_commit_vote_requires_stake() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -594,12 +1800,13 @@ mod tests {
         let escrow_id = client.create_escrow(&depositor, &beneficiary, &500);
         client.raise_dispute(&escrow_id, &depositor, &String::from_slice(&env, "test"));
 
-        let result = client.try_cast_vote(&escrow_id, &juror, &true);
-        assert!(result.is_err());
+        let commitment = hash_vote(&env, true, &test_salt(&env));
+        let result = client.try_commit_vote(&escrow_id, &juror, &commitment);
+        assert_eq!(result, Err(Ok(TrustFlowError::InsufficientStake)));
     }
 
     #[test]
-    fn test_cast_vote_duplicate_rejected() {
+    fn test_commit_vote_duplicate_rejected() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -614,10 +1821,213 @@ mod tests {
 
         let escrow_id = client.create_escrow(&depositor, &beneficiary, &500);
         client.raise_dispute(&escrow_id, &depositor, &String::from_slice(&env, "test"));
-        client.cast_vote(&escrow_id, &juror, &true);
+        let commitment = hash_vote(&env, true, &test_salt(&env));
+        client.commit_vote(&escrow_id, &juror, &commitment);
 
-        let result = client.try_cast_vote(&escrow_id, &juror, &true);
-        assert!(result.is_err());
+        let result = client.try_commit_vote(&escrow_id, &juror, &commitment);
+        assert_eq!(result, Err(Ok(TrustFlowError::AlreadyCommitted)));
+    }
+
+    #[test]
+    fn test_commit_vote_after_commit_deadline_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        let juror = Address::random(&env);
+
+        mint(&sac, &depositor, 500);
+        mint(&sac, &juror, 200);
+        client.stake(&juror, &200);
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &500);
+        client.raise_dispute(&escrow_id, &depositor, &String::from_slice(&env, "test"));
+        advance_ledger(&env, COMMIT_WINDOW_LEDGERS);
+
+        let commitment = hash_vote(&env, true, &test_salt(&env));
+        let result = client.try_commit_vote(&escrow_id, &juror, &commitment);
+        assert_eq!(result, Err(Ok(TrustFlowError::CommitPhaseEnded)));
+    }
+
+    #[test]
+    fn test_reveal_vote_before_commit_deadline_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        let juror = Address::random(&env);
+
+        mint(&sac, &depositor, 500);
+        mint(&sac, &juror, 200);
+        client.stake(&juror, &200);
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &500);
+        client.raise_dispute(&escrow_id, &depositor, &String::from_slice(&env, "test"));
+
+        let salt = test_salt(&env);
+        let commitment = hash_vote(&env, true, &salt);
+        client.commit_vote(&escrow_id, &juror, &commitment);
+
+        // Reveal window hasn't opened yet — commit phase is still active.
+        let result = client.try_reveal_vote(&escrow_id, &juror, &true, &salt);
+        assert_eq!(result, Err(Ok(TrustFlowError::RevealPhaseNotOpen)));
+    }
+
+    #[test]
+    fn test_reveal_vote_wrong_preimage_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        let juror = Address::random(&env);
+
+        mint(&sac, &depositor, 500);
+        mint(&sac, &juror, 200);
+        client.stake(&juror, &200);
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &500);
+        client.raise_dispute(&escrow_id, &depositor, &String::from_slice(&env, "test"));
+
+        let salt = test_salt(&env);
+        let commitment = hash_vote(&env, true, &salt);
+        client.commit_vote(&escrow_id, &juror, &commitment);
+        advance_ledger(&env, COMMIT_WINDOW_LEDGERS);
+
+        // Committed to `true`, attempts to reveal `false` — hash mismatch.
+        let result = client.try_reveal_vote(&escrow_id, &juror, &false, &salt);
+        assert_eq!(result, Err(Ok(TrustFlowError::InvalidReveal)));
+    }
+
+    #[test]
+    fn test_reveal_vote_duplicate_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        let juror = Address::random(&env);
+
+        mint(&sac, &depositor, 500);
+        mint(&sac, &juror, 200);
+        client.stake(&juror, &200);
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &500);
+        client.raise_dispute(&escrow_id, &depositor, &String::from_slice(&env, "test"));
+
+        let salt = test_salt(&env);
+        let commitment = hash_vote(&env, true, &salt);
+        client.commit_vote(&escrow_id, &juror, &commitment);
+        advance_ledger(&env, COMMIT_WINDOW_LEDGERS);
+        client.reveal_vote(&escrow_id, &juror, &true, &salt);
+
+        let result = client.try_reveal_vote(&escrow_id, &juror, &true, &salt);
+        assert_eq!(result, Err(Ok(TrustFlowError::AlreadyVoted)));
+    }
+
+    #[test]
+    fn test_reveal_vote_without_commit_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        let juror = Address::random(&env);
+
+        mint(&sac, &depositor, 500);
+        mint(&sac, &juror, 200);
+        client.stake(&juror, &200);
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &500);
+        client.raise_dispute(&escrow_id, &depositor, &String::from_slice(&env, "test"));
+        advance_ledger(&env, COMMIT_WINDOW_LEDGERS);
+
+        let salt = test_salt(&env);
+        let result = client.try_reveal_vote(&escrow_id, &juror, &true, &salt);
+        assert_eq!(result, Err(Ok(TrustFlowError::NoCommitFound)));
+    }
+
+    #[test]
+    fn test_same_salt_across_different_disputes_does_not_collide() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor1 = Address::random(&env);
+        let beneficiary1 = Address::random(&env);
+        let depositor2 = Address::random(&env);
+        let beneficiary2 = Address::random(&env);
+        let juror = Address::random(&env);
+
+        mint(&sac, &depositor1, 500);
+        mint(&sac, &depositor2, 500);
+        mint(&sac, &juror, 400);
+        client.stake(&juror, &400);
+
+        let escrow1 = client.create_escrow(&depositor1, &beneficiary1, &500);
+        let escrow2 = client.create_escrow(&depositor2, &beneficiary2, &500);
+
+        client.raise_dispute(&escrow1, &depositor1, &String::from_slice(&env, "d1"));
+        client.raise_dispute(&escrow2, &depositor2, &String::from_slice(&env, "d2"));
+
+        // Same salt and vote direction, but different disputes.
+        let salt = test_salt(&env);
+        let commitment = hash_vote(&env, true, &salt);
+        client.commit_vote(&escrow1, &juror, &commitment);
+        client.commit_vote(&escrow2, &juror, &commitment);
+
+        advance_ledger(&env, COMMIT_WINDOW_LEDGERS);
+
+        // Both reveals must succeed — commitments are keyed by
+        // (escrow_id, juror), so the same salt does not collide.
+        client.reveal_vote(&escrow1, &juror, &true, &salt);
+        client.reveal_vote(&escrow2, &juror, &true, &salt);
+    }
+
+    #[test]
+    fn test_commitment_cleared_after_reveal() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        let juror = Address::random(&env);
+
+        mint(&sac, &depositor, 500);
+        mint(&sac, &juror, 200);
+        client.stake(&juror, &200);
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &500);
+        client.raise_dispute(&escrow_id, &depositor, &String::from_slice(&env, "test"));
+
+        let salt = test_salt(&env);
+        let commitment = hash_vote(&env, true, &salt);
+        client.commit_vote(&escrow_id, &juror, &commitment);
+
+        // Commitment exists before reveal.
+        let commit_key = DataKey::JurorCommit(VoteKey {
+            escrow_id,
+            juror: juror.clone(),
+        });
+        assert!(env.as_contract(&client.address, || {
+            env.storage().persistent().has(&commit_key)
+        }));
+
+        advance_ledger(&env, COMMIT_WINDOW_LEDGERS);
+        client.reveal_vote(&escrow_id, &juror, &true, &salt);
+
+        // Commitment must be cleared after a successful reveal.
+        assert!(!env.as_contract(&client.address, || {
+            env.storage().persistent().has(&commit_key)
+        }));
     }
 
     // -----------------------------------------------------------------------
@@ -780,7 +2190,7 @@ mod tests {
         // remaining stake approximates 10_000 * 0.9^3 = 7_290.
         // Due to integer truncation the result is >= 7_290 and < 7_300.
         assert!(
-            stake_r3 >= 7_290 && stake_r3 <= 7_300,
+            (7_290..=7_300).contains(&stake_r3),
             "expected ~7290 after 3×10% slashes, got {stake_r3}"
         );
     }
@@ -860,8 +2270,15 @@ mod tests {
             &depositor,
             &String::from_slice(&env, "tie-break test"),
         );
-        client.cast_vote(&escrow_id, &juror_a, &true); // for depositor
-        client.cast_vote(&escrow_id, &juror_b, &false); // for beneficiary
+        let salt = test_salt(&env);
+        let commitment_a = hash_vote(&env, true, &salt);
+        let commitment_b = hash_vote(&env, false, &salt);
+        client.commit_vote(&escrow_id, &juror_a, &commitment_a); // for depositor
+        client.commit_vote(&escrow_id, &juror_b, &commitment_b); // for beneficiary
+        advance_ledger(&env, COMMIT_WINDOW_LEDGERS);
+        client.reveal_vote(&escrow_id, &juror_a, &true, &salt);
+        client.reveal_vote(&escrow_id, &juror_b, &false, &salt);
+        advance_ledger(&env, REVEAL_WINDOW_LEDGERS);
 
         let ruling = client.resolve_dispute(&escrow_id);
         assert!(ruling, "tie should rule for depositor");
@@ -894,9 +2311,10 @@ mod tests {
         mint(&sac, &depositor, 500);
         let escrow_id = client.create_escrow(&depositor, &beneficiary, &500);
         client.raise_dispute(&escrow_id, &depositor, &String::from_slice(&env, "test"));
+        advance_ledger(&env, COMMIT_WINDOW_LEDGERS + REVEAL_WINDOW_LEDGERS);
 
         let result = client.try_resolve_dispute(&escrow_id);
-        assert!(result.is_err());
+        assert_eq!(result, Err(Ok(TrustFlowError::NoVotesCast)));
     }
 
     #[test]
@@ -915,11 +2333,102 @@ mod tests {
         client.stake(&juror, &500);
         let escrow_id = client.create_escrow(&depositor, &beneficiary, &500);
         client.raise_dispute(&escrow_id, &depositor, &String::from_slice(&env, "test"));
-        client.cast_vote(&escrow_id, &juror, &true);
+
+        let salt = test_salt(&env);
+        let commitment = hash_vote(&env, true, &salt);
+        client.commit_vote(&escrow_id, &juror, &commitment);
+        advance_ledger(&env, COMMIT_WINDOW_LEDGERS);
+        client.reveal_vote(&escrow_id, &juror, &true, &salt);
+        advance_ledger(&env, REVEAL_WINDOW_LEDGERS);
         client.resolve_dispute(&escrow_id);
 
         let result = client.try_resolve_dispute(&escrow_id);
-        assert!(result.is_err());
+        assert_eq!(result, Err(Ok(TrustFlowError::DisputeAlreadyResolved)));
+    }
+
+    #[test]
+    fn test_resolve_dispute_before_reveal_deadline_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        let juror = Address::random(&env);
+
+        mint(&sac, &depositor, 500);
+        mint(&sac, &juror, 200);
+        client.stake(&juror, &200);
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &500);
+        client.raise_dispute(&escrow_id, &depositor, &String::from_slice(&env, "test"));
+
+        let salt = test_salt(&env);
+        let commitment = hash_vote(&env, true, &salt);
+        client.commit_vote(&escrow_id, &juror, &commitment);
+        advance_ledger(&env, COMMIT_WINDOW_LEDGERS);
+        client.reveal_vote(&escrow_id, &juror, &true, &salt);
+
+        // Reveal window is still open — resolve_dispute must be rejected.
+        let result = client.try_resolve_dispute(&escrow_id);
+        assert_eq!(result, Err(Ok(TrustFlowError::RevealPhaseNotEnded)));
+    }
+
+    #[test]
+    fn test_committed_but_unrevealed_vote_not_counted() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        let juror_a = Address::random(&env);
+        let juror_b = Address::random(&env);
+        let silent_juror = Address::random(&env);
+
+        mint(&sac, &depositor, 500);
+        mint(&sac, &juror_a, 200);
+        mint(&sac, &juror_b, 200);
+        mint(&sac, &silent_juror, 200);
+
+        client.stake(&juror_a, &200);
+        client.stake(&juror_b, &200);
+        client.stake(&silent_juror, &200);
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &500);
+        client.raise_dispute(&escrow_id, &depositor, &String::from_slice(&env, "test"));
+
+        let salt = test_salt(&env);
+        // All three commit, but only two reveal.
+        let commitment_for = hash_vote(&env, true, &salt);
+        let commitment_against = hash_vote(&env, false, &salt);
+        client.commit_vote(&escrow_id, &juror_a, &commitment_for);
+        client.commit_vote(&escrow_id, &juror_b, &commitment_against);
+        client.commit_vote(&escrow_id, &silent_juror, &commitment_for);
+
+        advance_ledger(&env, COMMIT_WINDOW_LEDGERS);
+
+        client.reveal_vote(&escrow_id, &juror_a, &true, &salt);
+        client.reveal_vote(&escrow_id, &juror_b, &false, &salt);
+        // silent_juror does NOT reveal
+
+        advance_ledger(&env, REVEAL_WINDOW_LEDGERS);
+        let ruling = client.resolve_dispute(&escrow_id);
+
+        // Depositor wins (1 for, 1 against, tie favours depositor)
+        assert!(ruling, "tie should rule for depositor");
+
+        // juror_b voted against and must be slashed
+        assert_eq!(client.get_slash_count(&juror_b), 1);
+        assert!(client.get_stake(&juror_b) < 200);
+
+        // silent_juror committed but never revealed — no slash, no vote counted
+        assert_eq!(client.get_slash_count(&silent_juror), 0);
+        assert_eq!(client.get_stake(&silent_juror), 200);
+
+        // juror_a voted with majority — no slash
+        assert_eq!(client.get_slash_count(&juror_a), 0);
+        assert_eq!(client.get_stake(&juror_a), 200);
     }
 
     #[test]
@@ -954,5 +2463,1408 @@ mod tests {
 
         // 100% slash: stake should be zero, not negative
         assert_eq!(client.get_stake(&malicious), 0);
+    }
+
+    #[test]
+    fn test_init_escrow_with_milestones() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+
+        mint(&sac, &depositor, 1_000);
+
+        let milestones = Vec::from_array(
+            &env,
+            [
+                Milestone {
+                    label: String::from_slice(&env, "Design"),
+                    amount: 400,
+                    approved: false,
+                    release_time: 0,
+                },
+                Milestone {
+                    label: String::from_slice(&env, "Development"),
+                    amount: 600,
+                    approved: false,
+                    release_time: 0,
+                },
+            ],
+        );
+
+        let escrow_id = client.init_escrow(&depositor, &beneficiary, &milestones);
+
+        // Verify balance transfer
+        assert_eq!(balance(&env, &token_addr, &depositor), 0);
+        assert_eq!(balance(&env, &token_addr, &client.address), 1_000);
+
+        // Verify escrow ID increment
+        assert_eq!(escrow_id, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // State archival / TTL bump strategy
+    // -----------------------------------------------------------------------
+
+    /// Advance the ledger sequence number, simulating the passage of time.
+    fn advance_ledger(env: &Env, ledgers: u32) {
+        env.ledger().with_mut(|li| {
+            li.sequence_number = li.sequence_number.saturating_add(ledgers);
+        });
+    }
+
+    #[test]
+    fn test_create_escrow_survives_default_ttl_window() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        mint(&sac, &depositor, 500);
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &500);
+
+        // The SDK's default persistent entry TTL is only 4096 ledgers
+        // (~a few hours). Advance well beyond that but still comfortably
+        // inside our 90-day bump window, and confirm the escrow is still
+        // reachable — proving `create_escrow`'s immediate TTL bump is what
+        // keeps it alive rather than the host's default.
+        advance_ledger(&env, 20_000);
+
+        client.raise_dispute(
+            &escrow_id,
+            &depositor,
+            &String::from_slice(&env, "still here"),
+        );
+    }
+
+    #[test]
+    fn test_bump_escrow_ttl_keeps_dormant_escrow_alive() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        mint(&sac, &depositor, 500);
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &500);
+
+        // Escrow sits untouched for a long time (e.g. a long milestone
+        // deadline). Advance to just inside the bump threshold window so a
+        // keeper's call to the permissionless maintenance entrypoint
+        // actually rewrites the TTL (the host no-ops bumps requested too
+        // early), then advance further.
+        advance_ledger(
+            &env,
+            PERSISTENT_BUMP_AMOUNT - PERSISTENT_LIFETIME_THRESHOLD + 1,
+        );
+        client.bump_escrow_ttl(&escrow_id);
+
+        // Advance past what the escrow's *original* un-bumped TTL (granted
+        // at creation) would have allowed — it only survives this because
+        // of the keeper's bump above.
+        advance_ledger(&env, PERSISTENT_LIFETIME_THRESHOLD);
+
+        client.raise_dispute(
+            &escrow_id,
+            &depositor,
+            &String::from_slice(&env, "kept alive by keeper"),
+        );
+    }
+
+    #[test]
+    fn test_bump_escrow_ttl_also_refreshes_dispute_storage() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let juror = Address::random(&env);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        mint(&sac, &juror, 500);
+        mint(&sac, &depositor, 500);
+        client.stake(&juror, &500);
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &500);
+        client.raise_dispute(
+            &escrow_id,
+            &depositor,
+            &String::from_slice(&env, "slow juror"),
+        );
+
+        // Commit before the large ledger advance (which would blow past the
+        // commit deadline).
+        let commitment = hash_vote(&env, true, &test_salt(&env));
+        client.commit_vote(&escrow_id, &juror, &commitment);
+
+        // A keeper sweep well before anything would lapse: bumps the escrow
+        // (and its dispute) as well as the juror's still-idle stake, since
+        // they haven't voted on anything yet either.
+        advance_ledger(
+            &env,
+            PERSISTENT_BUMP_AMOUNT - PERSISTENT_LIFETIME_THRESHOLD + 1,
+        );
+        client.bump_escrow_ttl(&escrow_id);
+        client.bump_juror_stake_ttl(&juror);
+        advance_ledger(&env, PERSISTENT_LIFETIME_THRESHOLD);
+
+        // The dispute record and the juror's stake must all still be
+        // reachable well past the escrow's original TTL. (A read through
+        // any entrypoint that touches archived storage would trap, so a
+        // successful read here proves the bump kept them alive; the
+        // commit/reveal windows themselves are far too short-lived to
+        // still be open after this much simulated time, so we read
+        // storage directly rather than going through `commit_vote`.)
+        let dispute = read_dispute(&env, &client.address, escrow_id);
+        assert!(!dispute.resolved);
+        assert_eq!(client.get_stake(&juror), 500);
+    }
+
+    #[test]
+    fn test_bump_escrow_ttl_nonexistent_escrow_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, _sac) = setup(&env, DEFAULT_SLASH_BPS);
+
+        let result = client.try_bump_escrow_ttl(&999);
+        assert_eq!(result, Err(Ok(TrustFlowError::EscrowNotFound)));
+    }
+
+    #[test]
+    fn test_bump_escrow_ttl_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        mint(&sac, &depositor, 500);
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &500);
+        // Push the entry to the edge of its bump window so the follow-up
+        // call is guaranteed to perform (not skip) the TTL rewrite.
+        advance_ledger(
+            &env,
+            PERSISTENT_BUMP_AMOUNT - PERSISTENT_LIFETIME_THRESHOLD + 1,
+        );
+
+        let live_until = client.bump_escrow_ttl(&escrow_id);
+
+        let expected_live_until = env
+            .ledger()
+            .sequence()
+            .saturating_add(PERSISTENT_BUMP_AMOUNT);
+        assert_eq!(live_until, expected_live_until);
+
+        let (event_contract, event_topics, event_data) = env.events().all().last().unwrap();
+        assert_eq!(event_contract, client.address);
+
+        let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+            (symbol_short!("escrow"), symbol_short!("ttlbump")).into_val(&env);
+        assert_eq!(event_topics, expected_topics);
+
+        let decoded = EscrowTtlBumped::try_from_val(&env, &event_data).unwrap();
+        assert_eq!(decoded.escrow_id, escrow_id);
+        assert_eq!(decoded.live_until_ledger, expected_live_until);
+    }
+
+    #[test]
+    fn test_bump_escrow_ttl_triggers_exactly_at_threshold_boundary() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        mint(&sac, &depositor, 500);
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &500);
+
+        // Advance so the escrow has *exactly* PERSISTENT_LIFETIME_THRESHOLD
+        // ledgers of TTL remaining (created at seq 0 with an expiration of
+        // PERSISTENT_BUMP_AMOUNT, so this advance leaves precisely that much
+        // remaining) — the boundary the host's `remaining <= threshold`
+        // check is defined on.
+        advance_ledger(&env, PERSISTENT_BUMP_AMOUNT - PERSISTENT_LIFETIME_THRESHOLD);
+        client.bump_escrow_ttl(&escrow_id);
+
+        // Advance one ledger past what the *original* un-bumped expiration
+        // would have been. If the threshold check were exclusive (`<`
+        // instead of `<=`) the bump above would have been skipped as "not
+        // yet due" and this read would hit a truly expired entry; since it
+        // succeeds, the refresh fired at exactly the documented boundary,
+        // not one ledger late.
+        advance_ledger(&env, PERSISTENT_LIFETIME_THRESHOLD + 1);
+
+        client.raise_dispute(
+            &escrow_id,
+            &depositor,
+            &String::from_slice(&env, "right at the boundary"),
+        );
+    }
+
+    #[test]
+    fn test_bump_juror_stake_ttl_nonexistent_juror_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, _sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let juror = Address::random(&env);
+
+        let result = client.try_bump_juror_stake_ttl(&juror);
+        assert_eq!(result, Err(Ok(TrustFlowError::JurorStakeNotFound)));
+    }
+
+    #[test]
+    fn test_bump_juror_stake_ttl_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let juror = Address::random(&env);
+        mint(&sac, &juror, 500);
+        client.stake(&juror, &500);
+
+        advance_ledger(
+            &env,
+            PERSISTENT_BUMP_AMOUNT - PERSISTENT_LIFETIME_THRESHOLD + 1,
+        );
+
+        let live_until = client.bump_juror_stake_ttl(&juror);
+
+        let expected_live_until = env
+            .ledger()
+            .sequence()
+            .saturating_add(PERSISTENT_BUMP_AMOUNT);
+        assert_eq!(live_until, expected_live_until);
+
+        let (event_contract, event_topics, event_data) = env.events().all().last().unwrap();
+        assert_eq!(event_contract, client.address);
+
+        let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+            (symbol_short!("juror"), symbol_short!("ttlbump")).into_val(&env);
+        assert_eq!(event_topics, expected_topics);
+
+        let decoded = JurorStakeTtlBumped::try_from_val(&env, &event_data).unwrap();
+        assert_eq!(decoded.juror, juror);
+        assert_eq!(decoded.live_until_ledger, expected_live_until);
+    }
+
+    #[test]
+    fn test_instance_ttl_survives_long_dormancy_between_calls() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+
+        // `initialize` already bumped instance TTL; simulate the contract
+        // going untouched for a long stretch and confirm it is still usable
+        // (the instance, holding Admin/Token/SlashBps/EscrowCounter, was not
+        // archived in the meantime).
+        advance_ledger(&env, 20_000);
+
+        let juror = Address::random(&env);
+        mint(&sac, &juror, 100);
+        client.stake(&juror, &100);
+        assert_eq!(client.get_stake(&juror), 100);
+    }
+
+    // -----------------------------------------------------------------------
+    // Atomic partial-milestone release with fee split to treasury
+    // -----------------------------------------------------------------------
+
+    /// Creates a single-milestone escrow of `milestone_amount` and returns
+    /// `(depositor, beneficiary, escrow_id)`.
+    fn setup_milestone_escrow(
+        env: &Env,
+        client: &TrustFlowClient,
+        sac: &token::StellarAssetClient,
+        milestone_amount: i128,
+    ) -> (Address, Address, u64) {
+        let depositor = Address::random(env);
+        let beneficiary = Address::random(env);
+        mint(sac, &depositor, milestone_amount);
+
+        let milestones = Vec::from_array(
+            env,
+            [Milestone {
+                label: String::from_slice(env, "Milestone 1"),
+                amount: milestone_amount,
+                approved: false,
+                release_time: 0, // No time-lock for backward compatibility
+            }],
+        );
+        let escrow_id = client.init_escrow(&depositor, &beneficiary, &milestones);
+        (depositor, beneficiary, escrow_id)
+    }
+
+    #[test]
+    fn test_release_milestone_exact_fee_split() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let (depositor, beneficiary, escrow_id) =
+            setup_milestone_escrow(&env, &client, &sac, 10_000);
+        let treasury = client.get_treasury();
+
+        client.release_milestone_tranche(&escrow_id, &0u32, &10_000, &depositor);
+
+        // Default fee is 50 bps (0.50%): floor(10_000 * 50 / 10_000) = 50.
+        assert_eq!(balance(&env, &token_addr, &beneficiary), 9_950);
+        assert_eq!(balance(&env, &token_addr, &treasury), 50);
+        assert_eq!(balance(&env, &token_addr, &client.address), 0);
+
+        let escrow = read_escrow(&env, &client.address, escrow_id);
+        assert_eq!(escrow.status, EscrowStatus::Settled);
+        assert!(escrow.milestones.get(0).unwrap().approved);
+    }
+
+    #[test]
+    fn test_release_milestone_rounding_zero_fee_tranche() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let (depositor, beneficiary, escrow_id) =
+            setup_milestone_escrow(&env, &client, &sac, 1_000);
+        let treasury = client.get_treasury();
+
+        // floor(100 * 50 / 10_000) = floor(0.5) = 0: the tranche fee rounds
+        // down to zero and the full tranche goes to the beneficiary.
+        client.release_milestone_tranche(&escrow_id, &0u32, &100, &depositor);
+
+        assert_eq!(balance(&env, &token_addr, &beneficiary), 100);
+        assert_eq!(balance(&env, &token_addr, &treasury), 0);
+        assert_eq!(
+            read_milestone_released(&env, &client.address, escrow_id, 0u32),
+            100
+        );
+    }
+
+    #[test]
+    fn test_fragmented_releases_charge_same_total_fee_as_single_release() {
+        let total_gross: i128 = 333;
+        let expected_total_fee = (total_gross * DEFAULT_FEE_BPS as i128) / BPS_DENOMINATOR;
+
+        // Fragmented scenario: the same total gross amount released across
+        // three tranches, in its own Env so nothing else can contaminate the
+        // treasury balance being measured.
+        let env_fragmented = Env::default();
+        env_fragmented.mock_all_auths();
+        let (client_f, token_addr_f, sac_f) = setup(&env_fragmented, DEFAULT_SLASH_BPS);
+        let treasury_f = client_f.get_treasury();
+        let (depositor_f, beneficiary_f, escrow_f) =
+            setup_milestone_escrow(&env_fragmented, &client_f, &sac_f, total_gross);
+
+        let treasury_before_fragmented = balance(&env_fragmented, &token_addr_f, &treasury_f);
+        let beneficiary_before_fragmented = balance(&env_fragmented, &token_addr_f, &beneficiary_f);
+        client_f.release_milestone_tranche(&escrow_f, &0u32, &111, &depositor_f);
+        client_f.release_milestone_tranche(&escrow_f, &0u32, &111, &depositor_f);
+        client_f.release_milestone_tranche(&escrow_f, &0u32, &111, &depositor_f);
+        let fragmented_total_fee =
+            balance(&env_fragmented, &token_addr_f, &treasury_f) - treasury_before_fragmented;
+        let fragmented_total_payout =
+            balance(&env_fragmented, &token_addr_f, &beneficiary_f) - beneficiary_before_fragmented;
+
+        // One-shot scenario: same total gross amount released in a single
+        // call, in a fully independent Env so balances, escrow IDs, events,
+        // and treasury state cannot contaminate the fragmented scenario
+        // above.
+        let env_one_shot = Env::default();
+        env_one_shot.mock_all_auths();
+        let (client_o, token_addr_o, sac_o) = setup(&env_one_shot, DEFAULT_SLASH_BPS);
+        let treasury_o = client_o.get_treasury();
+        let (depositor_o, _beneficiary_o, escrow_o) =
+            setup_milestone_escrow(&env_one_shot, &client_o, &sac_o, total_gross);
+
+        let treasury_before_one_shot = balance(&env_one_shot, &token_addr_o, &treasury_o);
+        client_o.release_milestone_tranche(&escrow_o, &0u32, &total_gross, &depositor_o);
+        let one_shot_total_fee =
+            balance(&env_one_shot, &token_addr_o, &treasury_o) - treasury_before_one_shot;
+
+        assert_eq!(fragmented_total_fee, one_shot_total_fee);
+        assert_eq!(fragmented_total_fee, expected_total_fee);
+        assert_eq!(one_shot_total_fee, expected_total_fee);
+        assert_eq!(fragmented_total_payout + fragmented_total_fee, total_gross);
+    }
+
+    #[test]
+    fn test_multiple_partial_releases_accumulate() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let (depositor, _beneficiary, escrow_id) =
+            setup_milestone_escrow(&env, &client, &sac, 1_000);
+
+        client.release_milestone_tranche(&escrow_id, &0u32, &400, &depositor);
+        assert_eq!(
+            read_milestone_released(&env, &client.address, escrow_id, 0u32),
+            400
+        );
+        assert_eq!(read_escrow_released(&env, &client.address, escrow_id), 400);
+        assert_eq!(
+            read_escrow(&env, &client.address, escrow_id).status,
+            EscrowStatus::Active
+        );
+
+        client.release_milestone_tranche(&escrow_id, &0u32, &300, &depositor);
+        assert_eq!(
+            read_milestone_released(&env, &client.address, escrow_id, 0u32),
+            700
+        );
+        assert_eq!(read_escrow_released(&env, &client.address, escrow_id), 700);
+        assert_eq!(
+            read_escrow(&env, &client.address, escrow_id).status,
+            EscrowStatus::Active
+        );
+    }
+
+    #[test]
+    fn test_final_release_settles_escrow() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        mint(&sac, &depositor, 1_000);
+
+        let milestones = Vec::from_array(
+            &env,
+            [
+                Milestone {
+                    label: String::from_slice(&env, "M1"),
+                    amount: 400,
+                    approved: false,
+                    release_time: 0,
+                },
+                Milestone {
+                    label: String::from_slice(&env, "M2"),
+                    amount: 600,
+                    approved: false,
+                    release_time: 0,
+                },
+            ],
+        );
+        let escrow_id = client.init_escrow(&depositor, &beneficiary, &milestones);
+
+        client.release_milestone_tranche(&escrow_id, &0u32, &400, &depositor);
+        assert_eq!(
+            read_escrow(&env, &client.address, escrow_id).status,
+            EscrowStatus::Active
+        );
+
+        client.release_milestone_tranche(&escrow_id, &1u32, &600, &depositor);
+        let escrow = read_escrow(&env, &client.address, escrow_id);
+        assert_eq!(escrow.status, EscrowStatus::Settled);
+        assert!(escrow.milestones.get(0).unwrap().approved);
+        assert!(escrow.milestones.get(1).unwrap().approved);
+    }
+
+    #[test]
+    fn test_release_zero_amount_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let (depositor, _beneficiary, escrow_id) =
+            setup_milestone_escrow(&env, &client, &sac, 1_000);
+
+        let result = client.try_release_milestone_tranche(&escrow_id, &0u32, &0, &depositor);
+        assert_eq!(result, Err(Ok(TrustFlowError::InvalidAmount)));
+    }
+
+    #[test]
+    fn test_release_excessive_amount_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let (depositor, _beneficiary, escrow_id) =
+            setup_milestone_escrow(&env, &client, &sac, 1_000);
+
+        let result = client.try_release_milestone_tranche(&escrow_id, &0u32, &1_001, &depositor);
+        assert_eq!(result, Err(Ok(TrustFlowError::MilestoneAmountMismatch)));
+
+        // A valid partial release followed by an over-release of the
+        // remainder must also fail, and must not mutate any state.
+        client.release_milestone_tranche(&escrow_id, &0u32, &600, &depositor);
+        let result = client.try_release_milestone_tranche(&escrow_id, &0u32, &500, &depositor);
+        assert_eq!(result, Err(Ok(TrustFlowError::MilestoneAmountMismatch)));
+        assert_eq!(
+            read_milestone_released(&env, &client.address, escrow_id, 0u32),
+            600
+        );
+    }
+
+    #[test]
+    fn test_release_nonexistent_milestone_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let (depositor, _beneficiary, escrow_id) =
+            setup_milestone_escrow(&env, &client, &sac, 1_000);
+
+        let result = client.try_release_milestone_tranche(&escrow_id, &5u32, &100, &depositor);
+        assert_eq!(result, Err(Ok(TrustFlowError::MilestoneNotFound)));
+    }
+
+    #[test]
+    fn test_release_unauthorized_caller_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let (_depositor, beneficiary, escrow_id) =
+            setup_milestone_escrow(&env, &client, &sac, 1_000);
+
+        // The beneficiary is not the depositor and must not be able to
+        // authorize a release.
+        let result = client.try_release_milestone_tranche(&escrow_id, &0u32, &500, &beneficiary);
+        assert_eq!(result, Err(Ok(TrustFlowError::Unauthorized)));
+    }
+
+    #[test]
+    fn test_release_on_disputed_escrow_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let (depositor, _beneficiary, escrow_id) =
+            setup_milestone_escrow(&env, &client, &sac, 1_000);
+
+        client.raise_dispute(&escrow_id, &depositor, &String::from_slice(&env, "test"));
+
+        let result = client.try_release_milestone_tranche(&escrow_id, &0u32, &500, &depositor);
+        assert_eq!(result, Err(Ok(TrustFlowError::InvalidState)));
+    }
+
+    #[test]
+    fn test_release_on_settled_escrow_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let (depositor, _beneficiary, escrow_id) =
+            setup_milestone_escrow(&env, &client, &sac, 1_000);
+
+        client.release_milestone_tranche(&escrow_id, &0u32, &1_000, &depositor);
+        assert_eq!(
+            read_escrow(&env, &client.address, escrow_id).status,
+            EscrowStatus::Settled
+        );
+
+        let result = client.try_release_milestone_tranche(&escrow_id, &0u32, &1, &depositor);
+        assert_eq!(result, Err(Ok(TrustFlowError::InvalidState)));
+    }
+
+    #[test]
+    fn test_milestone_time_locked_rejects_early_release() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        mint(&sac, &depositor, 1_000);
+
+        // Set release_time to future ledger (current + 100)
+        let current_ledger = env.ledger().sequence();
+        let future_ledger = current_ledger + 100;
+
+        let milestones = Vec::from_array(
+            &env,
+            [Milestone {
+                label: String::from_slice(&env, "Milestone 1"),
+                amount: 1_000,
+                approved: false,
+                release_time: future_ledger,
+            }],
+        );
+        let escrow_id = client.init_escrow(&depositor, &beneficiary, &milestones);
+
+        // Attempt to release before time-lock expires should fail
+        let result = client.try_release_milestone_tranche(&escrow_id, &0u32, &1_000, &depositor);
+        assert_eq!(result, Err(Ok(TrustFlowError::MilestoneTimeLocked)));
+    }
+
+    #[test]
+    fn test_milestone_time_locked_allows_release_after_deadline() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        mint(&sac, &depositor, 1_000);
+
+        // Set release_time to future ledger (current + 10)
+        let current_ledger = env.ledger().sequence();
+        let release_ledger = current_ledger + 10;
+
+        let milestones = Vec::from_array(
+            &env,
+            [Milestone {
+                label: String::from_slice(&env, "Milestone 1"),
+                amount: 1_000,
+                approved: false,
+                release_time: release_ledger,
+            }],
+        );
+        let escrow_id = client.init_escrow(&depositor, &beneficiary, &milestones);
+
+        // Attempt to release before time-lock expires should fail
+        let result = client.try_release_milestone_tranche(&escrow_id, &0u32, &1_000, &depositor);
+        assert_eq!(result, Err(Ok(TrustFlowError::MilestoneTimeLocked)));
+
+        // Advance ledger past release_time
+        advance_ledger(&env, 10);
+
+        // Release should now succeed
+        client.release_milestone_tranche(&escrow_id, &0u32, &1_000, &depositor);
+
+        // Verify funds were transferred
+        assert_eq!(balance(&env, &token_addr, &beneficiary), 995); // 1000 - 5 (50bps fee)
+    }
+
+    #[test]
+    fn test_milestone_time_locked_partial_release() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        mint(&sac, &depositor, 1_000);
+
+        // Set release_time to future ledger (current + 10)
+        let current_ledger = env.ledger().sequence();
+        let release_ledger = current_ledger + 10;
+
+        let milestones = Vec::from_array(
+            &env,
+            [Milestone {
+                label: String::from_slice(&env, "Milestone 1"),
+                amount: 1_000,
+                approved: false,
+                release_time: release_ledger,
+            }],
+        );
+        let escrow_id = client.init_escrow(&depositor, &beneficiary, &milestones);
+
+        // Partial release before time-lock should fail
+        let result = client.try_release_milestone_tranche(&escrow_id, &0u32, &500, &depositor);
+        assert_eq!(result, Err(Ok(TrustFlowError::MilestoneTimeLocked)));
+
+        // Advance ledger past release_time
+        advance_ledger(&env, 10);
+
+        // Partial release should now succeed
+        client.release_milestone_tranche(&escrow_id, &0u32, &500, &depositor);
+        assert_eq!(balance(&env, &token_addr, &beneficiary), 498); // 500 - 2 (50bps fee rounded)
+
+        // Second partial release should also succeed
+        client.release_milestone_tranche(&escrow_id, &0u32, &500, &depositor);
+        assert_eq!(balance(&env, &token_addr, &beneficiary), 995); // 1000 - 5 total
+    }
+
+    #[test]
+    fn test_multiple_milestones_different_time_locks() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        mint(&sac, &depositor, 1_000);
+
+        let current_ledger = env.ledger().sequence();
+
+        let milestones = Vec::from_array(
+            &env,
+            [
+                Milestone {
+                    label: String::from_slice(&env, "M1"),
+                    amount: 400,
+                    approved: false,
+                    release_time: current_ledger, // Immediately available
+                },
+                Milestone {
+                    label: String::from_slice(&env, "M2"),
+                    amount: 600,
+                    approved: false,
+                    release_time: current_ledger + 20, // Locked for 20 ledgers
+                },
+            ],
+        );
+        let escrow_id = client.init_escrow(&depositor, &beneficiary, &milestones);
+
+        // M1 should be immediately releasable
+        client.release_milestone_tranche(&escrow_id, &0u32, &400, &depositor);
+        assert_eq!(balance(&env, &token_addr, &beneficiary), 398); // 400 - 2 (50bps fee rounded)
+
+        // M2 should be time-locked
+        let result = client.try_release_milestone_tranche(&escrow_id, &1u32, &600, &depositor);
+        assert_eq!(result, Err(Ok(TrustFlowError::MilestoneTimeLocked)));
+
+        // Advance ledger past M2's release_time
+        advance_ledger(&env, 20);
+
+        // M2 should now be releasable
+        client.release_milestone_tranche(&escrow_id, &1u32, &600, &depositor);
+        assert_eq!(balance(&env, &token_addr, &beneficiary), 995); // 1000 - 5 total
+    }
+
+    #[test]
+    fn test_milestone_no_time_lock_immediate_release() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        mint(&sac, &depositor, 1_000);
+
+        // Set release_time to 0 (no time-lock)
+        let milestones = Vec::from_array(
+            &env,
+            [Milestone {
+                label: String::from_slice(&env, "Milestone 1"),
+                amount: 1_000,
+                approved: false,
+                release_time: 0,
+            }],
+        );
+        let escrow_id = client.init_escrow(&depositor, &beneficiary, &milestones);
+
+        // Should be immediately releasable
+        client.release_milestone_tranche(&escrow_id, &0u32, &1_000, &depositor);
+        assert_eq!(balance(&env, &token_addr, &beneficiary), 995); // 1000 - 5 (50bps fee)
+    }
+
+    #[test]
+    fn test_set_fee_bps_authorization_and_limits() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, _sac) = setup(&env, DEFAULT_SLASH_BPS);
+        // Default treasury is the admin, so this is the real stored admin.
+        let admin = client.get_treasury();
+
+        assert_eq!(client.get_fee_bps(), DEFAULT_FEE_BPS);
+
+        client.set_fee_bps(&admin, &200);
+        assert_eq!(client.get_fee_bps(), 200);
+
+        // Exceeds the 1_000 bps cap.
+        let result = client.try_set_fee_bps(&admin, &1_001);
+        assert_eq!(result, Err(Ok(TrustFlowError::InvalidFeeBps)));
+        assert_eq!(client.get_fee_bps(), 200);
+
+        // A non-admin caller must be rejected even though `mock_all_auths`
+        // makes every `require_auth()` call succeed.
+        let stranger = Address::random(&env);
+        let result = client.try_set_fee_bps(&stranger, &100);
+        assert_eq!(result, Err(Ok(TrustFlowError::Unauthorized)));
+        assert_eq!(client.get_fee_bps(), 200);
+    }
+
+    #[test]
+    fn test_set_treasury_authorization() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, _sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let admin = client.get_treasury();
+        let new_treasury = Address::random(&env);
+
+        // A non-admin caller must be rejected even though `mock_all_auths`
+        // makes every `require_auth()` call succeed.
+        let stranger = Address::random(&env);
+        let result = client.try_set_treasury(&stranger, &new_treasury);
+        assert_eq!(result, Err(Ok(TrustFlowError::Unauthorized)));
+        assert_eq!(client.get_treasury(), admin);
+
+        client.set_treasury(&admin, &new_treasury);
+        assert_eq!(client.get_treasury(), new_treasury);
+    }
+
+    #[test]
+    fn test_escrow_fee_snapshot_immutable_after_fee_change() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let admin = client.get_treasury();
+
+        let (_depositor, _beneficiary, escrow_id) =
+            setup_milestone_escrow(&env, &client, &sac, 1_000);
+        let snapshot_before = read_escrow_fee_config(&env, &client.address, escrow_id);
+        assert_eq!(snapshot_before.fee_bps, DEFAULT_FEE_BPS);
+
+        client.set_fee_bps(&admin, &500);
+
+        let snapshot_after = read_escrow_fee_config(&env, &client.address, escrow_id);
+        assert_eq!(snapshot_after, snapshot_before);
+        assert_eq!(snapshot_after.fee_bps, DEFAULT_FEE_BPS);
+
+        // A new escrow created after the change picks up the new default.
+        let depositor2 = Address::random(&env);
+        let beneficiary2 = Address::random(&env);
+        mint(&sac, &depositor2, 1_000);
+        let escrow_id_2 = client.create_escrow(&depositor2, &beneficiary2, &1_000);
+        let snapshot_2 = read_escrow_fee_config(&env, &client.address, escrow_id_2);
+        assert_eq!(snapshot_2.fee_bps, 500);
+    }
+
+    #[test]
+    fn test_escrow_treasury_snapshot_immutable_after_treasury_change() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let admin = client.get_treasury();
+
+        let (_depositor, _beneficiary, escrow_id) =
+            setup_milestone_escrow(&env, &client, &sac, 1_000);
+        let snapshot_before = read_escrow_fee_config(&env, &client.address, escrow_id);
+        assert_eq!(snapshot_before.treasury, admin);
+
+        let new_treasury = Address::random(&env);
+        client.set_treasury(&admin, &new_treasury);
+
+        let snapshot_after = read_escrow_fee_config(&env, &client.address, escrow_id);
+        assert_eq!(snapshot_after, snapshot_before);
+        assert_eq!(snapshot_after.treasury, admin);
+
+        // A new escrow created after the change picks up the new treasury.
+        let depositor2 = Address::random(&env);
+        let beneficiary2 = Address::random(&env);
+        mint(&sac, &depositor2, 1_000);
+        let escrow_id_2 = client.create_escrow(&depositor2, &beneficiary2, &1_000);
+        let snapshot_2 = read_escrow_fee_config(&env, &client.address, escrow_id_2);
+        assert_eq!(snapshot_2.treasury, new_treasury);
+    }
+
+    #[test]
+    fn test_release_milestone_tranche_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let (depositor, beneficiary, escrow_id) =
+            setup_milestone_escrow(&env, &client, &sac, 10_000);
+        let treasury = client.get_treasury();
+
+        client.release_milestone_tranche(&escrow_id, &0u32, &10_000, &depositor);
+
+        let (event_contract, event_topics, event_data) = env.events().all().last().unwrap();
+        assert_eq!(event_contract, client.address);
+
+        let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> = (
+            symbol_short!("mstone"),
+            symbol_short!("release"),
+            escrow_id,
+            0u32,
+        )
+            .into_val(&env);
+        assert_eq!(event_topics, expected_topics);
+
+        let decoded = MilestoneTrancheReleased::try_from_val(&env, &event_data).unwrap();
+        assert_eq!(decoded.gross_amount, 10_000);
+        assert_eq!(decoded.treasury_fee, 50);
+        assert_eq!(decoded.beneficiary_payout, 9_950);
+        assert_eq!(decoded.milestone_released, 10_000);
+        assert_eq!(decoded.escrow_released, 10_000);
+        assert_eq!(decoded.beneficiary, beneficiary);
+        assert_eq!(decoded.treasury, treasury);
+    }
+
+    #[test]
+    fn test_raise_dispute_refreshes_partial_release_accounting_ttl() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let (depositor, _beneficiary, escrow_id) =
+            setup_milestone_escrow(&env, &client, &sac, 1_000);
+
+        client.release_milestone_tranche(&escrow_id, &0u32, &400, &depositor);
+
+        advance_ledger(
+            &env,
+            PERSISTENT_BUMP_AMOUNT - PERSISTENT_LIFETIME_THRESHOLD + 1,
+        );
+
+        client.raise_dispute(
+            &escrow_id,
+            &depositor,
+            &String::from_slice(&env, "ttl regression"),
+        );
+
+        // Move beyond the original expiration of the release counter.
+        // No token invocation is needed after this point.
+        advance_ledger(&env, PERSISTENT_LIFETIME_THRESHOLD);
+
+        assert_eq!(read_escrow_released(&env, &client.address, escrow_id), 400);
+        assert_eq!(
+            read_escrow(&env, &client.address, escrow_id).status,
+            EscrowStatus::Disputed
+        );
+    }
+    #[test]
+    fn test_dispute_settlement_after_partial_release_transfers_remaining_only() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let (depositor, beneficiary, escrow_id) =
+            setup_milestone_escrow(&env, &client, &sac, 1_000);
+
+        // Partial release before the dispute is raised.
+        client.release_milestone_tranche(&escrow_id, &0u32, &400, &depositor);
+        let beneficiary_balance_after_partial = balance(&env, &token_addr, &beneficiary);
+
+        client.raise_dispute(
+            &escrow_id,
+            &depositor,
+            &String::from_slice(&env, "scope changed"),
+        );
+
+        let juror = Address::random(&env);
+        mint(&sac, &juror, 500);
+        client.stake(&juror, &500);
+
+        let salt = test_salt(&env);
+        let commitment = hash_vote(&env, false, &salt);
+        client.commit_vote(&escrow_id, &juror, &commitment); // rules for beneficiary
+        advance_ledger(&env, COMMIT_WINDOW_LEDGERS);
+        client.reveal_vote(&escrow_id, &juror, &false, &salt);
+        advance_ledger(&env, REVEAL_WINDOW_LEDGERS);
+
+        let contract_balance_before = balance(&env, &token_addr, &client.address);
+        client.resolve_dispute(&escrow_id);
+
+        // Only the still-locked 600 (1_000 - 400 already released) may move
+        // — transferring the original full 1_000 here would double-pay the
+        // beneficiary for the 400 already released.
+        assert_eq!(
+            balance(&env, &token_addr, &beneficiary),
+            beneficiary_balance_after_partial + 600
+        );
+        assert_eq!(
+            balance(&env, &token_addr, &client.address),
+            contract_balance_before - 600
+        );
+
+        let escrow = read_escrow(&env, &client.address, escrow_id);
+        assert_eq!(escrow.status, EscrowStatus::Settled);
+    }
+
+    #[test]
+    fn test_no_balance_leakage_matches_gross_release() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let (depositor, _beneficiary, escrow_id) =
+            setup_milestone_escrow(&env, &client, &sac, 10_000);
+
+        let contract_balance_before = balance(&env, &token_addr, &client.address);
+
+        client.release_milestone_tranche(&escrow_id, &0u32, &3_333, &depositor);
+        client.release_milestone_tranche(&escrow_id, &0u32, &3_333, &depositor);
+        client.release_milestone_tranche(&escrow_id, &0u32, &3_334, &depositor);
+
+        let contract_balance_after = balance(&env, &token_addr, &client.address);
+        // The contract's balance must drop by exactly the gross amount
+        // released — no more (leaked) and no less (stuck) than what left as
+        // beneficiary payout + treasury fee.
+        assert_eq!(contract_balance_before - contract_balance_after, 10_000);
+
+        let escrow = read_escrow(&env, &client.address, escrow_id);
+        assert_eq!(escrow.status, EscrowStatus::Settled);
+    }
+
+    // -----------------------------------------------------------------------
+    // Atomic rollback on transfer failure
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_release_milestone_tranche_rolls_back_atomically_on_transfer_failure() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let (depositor, beneficiary, escrow_id) =
+            setup_milestone_escrow(&env, &client, &sac, 10_000);
+        let treasury = client.get_treasury();
+
+        let token_client = token::Client::new(&env, &token_addr);
+
+        // Default fee is 50 bps: gross 10_000 splits into beneficiary
+        // payout 9_950 and treasury fee 50. Burn exactly 50 from the
+        // TrustFlow contract so the first transfer can execute but the
+        // second transfer fails due to insufficient remaining balance.
+        token_client.burn(&client.address, &50);
+
+        let beneficiary_balance_before = balance(&env, &token_addr, &beneficiary);
+        let treasury_balance_before = balance(&env, &token_addr, &treasury);
+        let contract_balance_before = balance(&env, &token_addr, &client.address);
+        assert_eq!(contract_balance_before, 9_950);
+        assert_eq!(beneficiary_balance_before, 0);
+        assert_eq!(treasury_balance_before, 0);
+
+        let escrow_before = read_escrow(&env, &client.address, escrow_id);
+        assert_eq!(escrow_before.amount, 10_000);
+
+        let milestone_released_before =
+            read_milestone_released(&env, &client.address, escrow_id, 0u32);
+        let escrow_released_before = read_escrow_released(&env, &client.address, escrow_id);
+
+        let result = client.try_release_milestone_tranche(&escrow_id, &0u32, &10_000, &depositor);
+        assert_eq!(result, Err(Ok(TrustFlowError::TokenTransferFailed)));
+
+        // Nothing must have moved or been recorded: the failed treasury leg
+        // must roll back the beneficiary transfer and all accounting too.
+        // The pre-existing burn is not itself rolled back -- it happened
+        // before (and independently of) the failed release invocation.
+        assert_eq!(
+            balance(&env, &token_addr, &beneficiary),
+            beneficiary_balance_before
+        );
+        assert_eq!(
+            balance(&env, &token_addr, &treasury),
+            treasury_balance_before
+        );
+        assert_eq!(balance(&env, &token_addr, &client.address), 9_950);
+
+        let escrow_after = read_escrow(&env, &client.address, escrow_id);
+        assert_eq!(escrow_after.status, EscrowStatus::Active);
+        assert_eq!(escrow_after.status, escrow_before.status);
+        assert!(!escrow_after.milestones.get(0).unwrap().approved);
+        assert_eq!(
+            read_milestone_released(&env, &client.address, escrow_id, 0u32),
+            milestone_released_before
+        );
+        assert_eq!(
+            read_escrow_released(&env, &client.address, escrow_id),
+            escrow_released_before
+        );
+
+        // Failed token calls may remain visible in the test event log.
+        // Verify specifically that TrustFlow did not emit its success event.
+        let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> = (
+            symbol_short!("mstone"),
+            symbol_short!("release"),
+            escrow_id,
+            0u32,
+        )
+            .into_val(&env);
+
+        let emitted_release_event =
+            env.events()
+                .all()
+                .iter()
+                .any(|(event_contract, event_topics, _)| {
+                    event_contract == client.address && event_topics == expected_topics
+                });
+
+        assert!(!emitted_release_event);
+    }
+
+    // -----------------------------------------------------------------------
+    // Role-Based Emergency Pause & Circuit Breaker Tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pause_and_unpause_by_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _token_addr, _sac) = setup(&env, 1000);
+        let admin = env.as_contract(&client.address, || {
+            env.storage().instance().get(&DataKey::Admin).unwrap()
+        });
+
+        assert!(!client.is_paused());
+
+        // Admin pauses
+        client.pause(&admin);
+        assert!(client.is_paused());
+
+        // Admin unpauses
+        client.unpause(&admin);
+        assert!(!client.is_paused());
+    }
+
+    #[test]
+    fn test_pauser_role_can_pause_and_cannot_unpause() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _token_addr, _sac) = setup(&env, 1000);
+        let admin: Address = env.as_contract(&client.address, || {
+            env.storage().instance().get(&DataKey::Admin).unwrap()
+        });
+        let pauser = Address::random(&env);
+
+        // Set pauser role
+        client.set_pauser(&admin, &pauser);
+        assert_eq!(client.get_pauser(), Some(pauser.clone()));
+
+        // Pauser can trigger emergency pause
+        client.pause(&pauser);
+        assert!(client.is_paused());
+
+        // Pauser CANNOT unpause (only Admin can)
+        assert_eq!(
+            client.try_unpause(&pauser),
+            Err(Ok(TrustFlowError::Unauthorized))
+        );
+        assert!(client.is_paused());
+
+        // Admin can unpause
+        client.unpause(&admin);
+        assert!(!client.is_paused());
+    }
+
+    #[test]
+    fn test_set_and_revoke_pauser_admin_only() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _token_addr, _sac) = setup(&env, 1000);
+        let admin: Address = env.as_contract(&client.address, || {
+            env.storage().instance().get(&DataKey::Admin).unwrap()
+        });
+        let pauser = Address::random(&env);
+        let outsider = Address::random(&env);
+
+        // Outsider cannot set pauser
+        assert_eq!(
+            client.try_set_pauser(&outsider, &pauser),
+            Err(Ok(TrustFlowError::Unauthorized))
+        );
+        assert_eq!(client.get_pauser(), None);
+
+        // Admin sets pauser
+        client.set_pauser(&admin, &pauser);
+        assert_eq!(client.get_pauser(), Some(pauser.clone()));
+
+        // Outsider cannot revoke pauser
+        assert_eq!(
+            client.try_revoke_pauser(&outsider),
+            Err(Ok(TrustFlowError::Unauthorized))
+        );
+        assert_eq!(client.get_pauser(), Some(pauser.clone()));
+
+        // Admin revokes pauser
+        client.revoke_pauser(&admin);
+        assert_eq!(client.get_pauser(), None);
+
+        // Revoked pauser can no longer pause
+        assert_eq!(
+            client.try_pause(&pauser),
+            Err(Ok(TrustFlowError::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn test_unauthorized_callers_cannot_pause_or_unpause() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _token_addr, _sac) = setup(&env, 1000);
+        let outsider = Address::random(&env);
+
+        assert_eq!(
+            client.try_pause(&outsider),
+            Err(Ok(TrustFlowError::Unauthorized))
+        );
+        assert_eq!(
+            client.try_unpause(&outsider),
+            Err(Ok(TrustFlowError::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn test_circuit_breaker_halts_sensitive_entrypoints() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _token_addr, sac) = setup(&env, 1000);
+        let admin: Address = env.as_contract(&client.address, || {
+            env.storage().instance().get(&DataKey::Admin).unwrap()
+        });
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        let juror = Address::random(&env);
+
+        mint(&sac, &depositor, 100_000);
+        mint(&sac, &juror, 100_000);
+
+        // Pause the contract
+        client.pause(&admin);
+        assert!(client.is_paused());
+
+        // 1. stake is blocked
+        assert_eq!(
+            client.try_stake(&juror, &10_000),
+            Err(Ok(TrustFlowError::ContractPaused))
+        );
+
+        // 2. unstake is blocked
+        assert_eq!(
+            client.try_unstake(&juror, &1_000),
+            Err(Ok(TrustFlowError::ContractPaused))
+        );
+
+        // 3. create_escrow is blocked
+        assert_eq!(
+            client.try_create_escrow(&depositor, &beneficiary, &50_000),
+            Err(Ok(TrustFlowError::ContractPaused))
+        );
+
+        // 4. init_escrow is blocked
+        let milestones = soroban_sdk::vec![
+            &env,
+            Milestone {
+                label: String::from_slice(&env, "M1"),
+                amount: 50_000,
+                approved: false,
+                release_time: 0,
+            }
+        ];
+        assert_eq!(
+            client.try_init_escrow(&depositor, &beneficiary, &milestones),
+            Err(Ok(TrustFlowError::ContractPaused))
+        );
+
+        // Unpause to create an active escrow for remaining entrypoint checks
+        client.unpause(&admin);
+        let escrow_id = client.init_escrow(&depositor, &beneficiary, &milestones);
+        client.stake(&juror, &10_000);
+
+        // Re-pause
+        client.pause(&admin);
+
+        // 5. release_milestone_tranche is blocked
+        assert_eq!(
+            client.try_release_milestone_tranche(&escrow_id, &0u32, &50_000, &depositor),
+            Err(Ok(TrustFlowError::ContractPaused))
+        );
+
+        // 6. raise_dispute is blocked
+        assert_eq!(
+            client.try_raise_dispute(&escrow_id, &depositor, &String::from_slice(&env, "Issue")),
+            Err(Ok(TrustFlowError::ContractPaused))
+        );
+
+        // Unpause to raise dispute
+        client.unpause(&admin);
+        client.raise_dispute(&escrow_id, &depositor, &String::from_slice(&env, "Issue"));
+
+        // Re-pause
+        client.pause(&admin);
+
+        // 7. commit_vote is blocked
+        let commitment = soroban_sdk::BytesN::from_array(&env, &[1u8; 32]);
+        assert_eq!(
+            client.try_commit_vote(&escrow_id, &juror, &commitment),
+            Err(Ok(TrustFlowError::ContractPaused))
+        );
+
+        // 8. reveal_vote is blocked
+        let salt = soroban_sdk::BytesN::from_array(&env, &[2u8; 32]);
+        assert_eq!(
+            client.try_reveal_vote(&escrow_id, &juror, &true, &salt),
+            Err(Ok(TrustFlowError::ContractPaused))
+        );
+
+        // 9. resolve_dispute is blocked
+        assert_eq!(
+            client.try_resolve_dispute(&escrow_id),
+            Err(Ok(TrustFlowError::ContractPaused))
+        );
+    }
+
+    #[test]
+    fn test_read_only_and_maintenance_work_during_pause() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _token_addr, sac) = setup(&env, 1000);
+        let admin: Address = env.as_contract(&client.address, || {
+            env.storage().instance().get(&DataKey::Admin).unwrap()
+        });
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        let juror = Address::random(&env);
+
+        mint(&sac, &depositor, 100_000);
+        mint(&sac, &juror, 100_000);
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &50_000);
+        client.stake(&juror, &10_000);
+
+        // Emergency Pause
+        client.pause(&admin);
+
+        // Read-only queries must still work:
+        assert_eq!(client.get_fee_bps(), 50);
+        assert_eq!(client.get_stake(&juror), 10_000);
+        assert_eq!(client.get_slash_count(&juror), 0);
+        assert!(client.is_paused());
+
+        // Storage maintenance (TTL bump) must still work (returns ledger seq):
+        assert!(client.bump_escrow_ttl(&escrow_id) > 0);
+        assert!(client.bump_juror_stake_ttl(&juror) > 0);
+    }
+
+    #[test]
+    fn test_unpause_resumes_operations_funds_not_stranded() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, token_addr, sac) = setup(&env, 1000);
+        let admin: Address = env.as_contract(&client.address, || {
+            env.storage().instance().get(&DataKey::Admin).unwrap()
+        });
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+
+        mint(&sac, &depositor, 100_000);
+
+        let milestones = soroban_sdk::vec![
+            &env,
+            Milestone {
+                label: String::from_slice(&env, "M1"),
+                amount: 50_000,
+                approved: false,
+                release_time: 0,
+            }
+        ];
+        let escrow_id = client.init_escrow(&depositor, &beneficiary, &milestones);
+
+        // Incident occurs: Pauser pauses contract
+        let pauser = Address::random(&env);
+        client.set_pauser(&admin, &pauser);
+        client.pause(&pauser);
+
+        // Actions blocked
+        assert_eq!(
+            client.try_release_milestone_tranche(&escrow_id, &0u32, &50_000, &depositor),
+            Err(Ok(TrustFlowError::ContractPaused))
+        );
+
+        // Incident resolved: Admin unpauses
+        client.unpause(&admin);
+
+        // Normal operations resume, funds released successfully
+        client.release_milestone_tranche(&escrow_id, &0u32, &50_000, &depositor);
+
+        assert_eq!(balance(&env, &token_addr, &beneficiary), 49_750);
     }
 }
