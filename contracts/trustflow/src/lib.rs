@@ -53,12 +53,22 @@ const LEDGERS_PER_DAY: u32 = 17_280;
 // locked in before the commit window closes, and the reveal window only
 // opens once no further commitments are possible, so no juror can ever see
 // another's vote before their own is already fixed on-chain.
+// TODO: consider making these admin-configurable in a follow-up PR so the
+// commit/reveal windows can be tuned without a contract upgrade.
 const COMMIT_WINDOW_LEDGERS: u32 = LEDGERS_PER_DAY;
 const REVEAL_WINDOW_LEDGERS: u32 = LEDGERS_PER_DAY;
 
 /// Hashes a `(vote, salt)` pair into the commitment format used by
-/// `commit_vote`/`reveal_vote`: `sha256(vote_byte ++ salt)`. Callers building
-/// a commitment off-chain must reproduce this exact preimage layout.
+/// `commit_vote`/`reveal_vote`: `sha256(vote_byte ++ salt)`.
+///
+/// Preimage layout (33 bytes total):
+///   [0]     vote_byte — 0x01 (for depositor) or 0x00 (for beneficiary)
+///   [1..33] salt      — 32 bytes of caller-chosen randomness
+///
+/// Callers building a commitment off-chain must reproduce this exact
+/// concatenation. The salt length is enforced to 32 bytes by the
+/// [`BytesN<32>`] type at the contract boundary; off-chain tooling must
+/// pad or generate 32 bytes accordingly.
 fn hash_vote(env: &Env, vote_for_depositor: bool, salt: &BytesN<32>) -> BytesN<32> {
     let mut preimage = Bytes::new(env);
     preimage.push_back(if vote_for_depositor { 1u8 } else { 0u8 });
@@ -225,6 +235,8 @@ pub enum TrustFlowError {
     RevealPhaseNotEnded = 21,
     /// Returned when a sensitive contract entrypoint is called while the contract is paused.
     ContractPaused = 22,
+    /// `release_milestone_tranche` called before the milestone's time-lock has expired.
+    MilestoneTimeLocked = 23,
 }
 
 // ---------------------------------------------------------------------------
@@ -459,6 +471,7 @@ pub struct Milestone {
     pub label: String,
     pub amount: i128,
     pub approved: bool,
+    pub release_time: u32,
 }
 
 #[contracttype]
@@ -708,8 +721,21 @@ impl TrustFlow {
 
         let key = DataKey::JurorStake(juror.clone());
         let prev: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        env.storage().persistent().set(&key, &(prev + amount));
+        let new_total = prev
+            .checked_add(amount)
+            .ok_or(TrustFlowError::ArithmeticOverflow)?;
+        env.storage().persistent().set(&key, &new_total);
         extend_persistent_ttl(&env, &key);
+
+        env.events().publish(
+            (symbol_short!("stake"), symbol_short!("staked")),
+            Staked {
+                juror,
+                amount,
+                new_total,
+            },
+        );
+
         Ok(())
     }
 
@@ -725,8 +751,21 @@ impl TrustFlow {
         }
         let token: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         token::Client::new(&env, &token).transfer(&env.current_contract_address(), &juror, &amount);
-        env.storage().persistent().set(&key, &(current - amount));
+        let remaining = current
+            .checked_sub(amount)
+            .ok_or(TrustFlowError::ArithmeticOverflow)?;
+        env.storage().persistent().set(&key, &remaining);
         extend_persistent_ttl(&env, &key);
+
+        env.events().publish(
+            (symbol_short!("stake"), symbol_short!("unstaked")),
+            Unstaked {
+                juror,
+                amount,
+                remaining,
+            },
+        );
+
         Ok(())
     }
 
@@ -808,7 +847,9 @@ impl TrustFlow {
             .instance()
             .get(&DataKey::EscrowCounter)
             .unwrap_or(0);
-        let id = counter + 1;
+        let id = counter
+            .checked_add(1)
+            .ok_or(TrustFlowError::ArithmeticOverflow)?;
         env.storage().instance().set(&DataKey::EscrowCounter, &id);
 
         let escrow_key = DataKey::Escrow(id);
@@ -844,7 +885,9 @@ impl TrustFlow {
             if m.amount <= 0 {
                 return Err(TrustFlowError::InvalidAmount);
             }
-            total_amount += m.amount;
+            total_amount = total_amount
+                .checked_add(m.amount)
+                .ok_or(TrustFlowError::ArithmeticOverflow)?;
         }
 
         if total_amount <= 0 {
@@ -863,7 +906,9 @@ impl TrustFlow {
             .instance()
             .get(&DataKey::EscrowCounter)
             .unwrap_or(0);
-        let id = counter + 1;
+        let id = counter
+            .checked_add(1)
+            .ok_or(TrustFlowError::ArithmeticOverflow)?;
         env.storage().instance().set(&DataKey::EscrowCounter, &id);
 
         let escrow_key = DataKey::Escrow(id);
@@ -939,6 +984,12 @@ impl TrustFlow {
             .milestones
             .get(milestone_index)
             .ok_or(TrustFlowError::MilestoneNotFound)?;
+
+        // Time-lock check: milestone cannot be claimed before its release_time
+        let current_ledger = env.ledger().sequence();
+        if current_ledger < milestone.release_time {
+            return Err(TrustFlowError::MilestoneTimeLocked);
+        }
 
         let milestone_key = DataKey::MilestoneReleased(MilestoneKey {
             escrow_id,
@@ -1120,6 +1171,16 @@ impl TrustFlow {
     /// (or via [`TrustFlow::hash_vote`] in tests) and keep `vote` and `salt`
     /// secret until the reveal phase. Only callable before the dispute's
     /// commit window closes.
+    ///
+    /// **Hash preimage format** (for integrators building commitments
+    /// off-chain):
+    /// - `vote_byte`: `0x01` if voting for the depositor, `0x00` if voting
+    ///   for the beneficiary (single byte).
+    /// - `salt`: exactly 32 bytes of caller-chosen randomness (the
+    ///   [`BytesN<32>`] type enforces this length on-chain; off-chain
+    ///   tooling must pad or generate 32 bytes).
+    /// - The preimage is the concatenation `[vote_byte, salt[0], salt[1],
+    ///   ..., salt[31]]` (33 bytes total), hashed with SHA-256.
     pub fn commit_vote(
         env: Env,
         escrow_id: u64,
@@ -1177,8 +1238,20 @@ impl TrustFlow {
     /// revealed `(vote_for_depositor, salt)` pair must hash to the juror's
     /// stored commitment.
     ///
+    /// After a successful reveal the stored commitment is cleared to free
+    /// storage and prevent accidental reuse; the vote itself is recorded
+    /// under [`DataKey::JurorVote`] and the juror is appended to the
+    /// dispute's voter list.
+    ///
+    /// Replay protection: a second call for the same `(escrow_id, juror)`
+    /// is rejected with [`TrustFlowError::AlreadyVoted`] because the
+    /// [`DataKey::JurorVote`] entry already exists.
+    ///
     /// * `vote_for_depositor` – `true` rules in favour of the depositor;
     ///   `false` rules in favour of the beneficiary.
+    /// * `salt` – the exact 32-byte salt used when computing the
+    ///   commitment. Must match the preimage documented in
+    ///   [`TrustFlow::commit_vote`].
     pub fn reveal_vote(
         env: Env,
         escrow_id: u64,
@@ -1204,6 +1277,17 @@ impl TrustFlow {
             return Err(TrustFlowError::RevealPhaseNotOpen);
         }
 
+        // Check AlreadyVoted before NoCommitFound: after a successful
+        // reveal the commitment is cleared, so a duplicate reveal would
+        // otherwise surface the wrong error.
+        let vote_key = DataKey::JurorVote(VoteKey {
+            escrow_id,
+            juror: juror.clone(),
+        });
+        if env.storage().persistent().has(&vote_key) {
+            return Err(TrustFlowError::AlreadyVoted);
+        }
+
         let commit_key = DataKey::JurorCommit(VoteKey {
             escrow_id,
             juror: juror.clone(),
@@ -1214,14 +1298,6 @@ impl TrustFlow {
             .get(&commit_key)
             .ok_or(TrustFlowError::NoCommitFound)?;
 
-        let vote_key = DataKey::JurorVote(VoteKey {
-            escrow_id,
-            juror: juror.clone(),
-        });
-        if env.storage().persistent().has(&vote_key) {
-            return Err(TrustFlowError::AlreadyVoted);
-        }
-
         if hash_vote(&env, vote_for_depositor, &salt) != commitment {
             return Err(TrustFlowError::InvalidReveal);
         }
@@ -1230,6 +1306,9 @@ impl TrustFlow {
             .persistent()
             .set(&vote_key, &vote_for_depositor);
         extend_persistent_ttl(&env, &vote_key);
+
+        // Clear the commitment to free storage and prevent accidental reuse.
+        env.storage().persistent().remove(&commit_key);
 
         let voters_key = DataKey::DisputeVoters(escrow_id);
         let mut voters: Vec<Address> = env
@@ -1300,9 +1379,13 @@ impl TrustFlow {
                 }))
                 .unwrap_or(false);
             if vote {
-                for_depositor += 1;
+                for_depositor = for_depositor
+                    .checked_add(1)
+                    .ok_or(TrustFlowError::ArithmeticOverflow)?;
             } else {
-                for_beneficiary += 1;
+                for_beneficiary = for_beneficiary
+                    .checked_add(1)
+                    .ok_or(TrustFlowError::ArithmeticOverflow)?;
             }
         }
 
@@ -1329,14 +1412,43 @@ impl TrustFlow {
             if vote != ruling {
                 let stake_key = DataKey::JurorStake(voter.clone());
                 let stake: i128 = env.storage().persistent().get(&stake_key).unwrap_or(0);
-                // slash_amount = stake * slash_bps / 10_000, saturating at stake
-                let slash = stake
-                    .checked_mul(slash_bps as i128)
-                    .unwrap_or(stake * DEFAULT_SLASH_BPS as i128)
-                    .checked_div(10_000)
-                    .unwrap_or(0)
-                    .min(stake);
-                env.storage().persistent().set(&stake_key, &(stake - slash));
+                // slash_amount = stake * slash_bps / 10_000, capped at stake.
+                //
+                // Three-tier safe arithmetic:
+                //   1. Try i128 checked_mul (fast path, covers typical values).
+                //   2. Widen to u128 for stakes up to ~3.4e35 with bps up to
+                //      ~10_000 (covers virtually all realistic values).
+                //   3. If even u128 overflows, divide first then multiply —
+                //      this truncates early but guarantees no overflow for any
+                //      stake/bps combination that fits in i128.
+                let slash: i128 = {
+                    let stake_u128 = stake as u128;
+                    let bps_u128 = slash_bps as u128;
+                    let slash_u128 = stake
+                        .checked_mul(slash_bps as i128)
+                        .and_then(|v| v.checked_div(10_000))
+                        .map(|v| v as u128)
+                        .or_else(|| {
+                            // i128 overflow — try u128
+                            stake_u128
+                                .checked_mul(bps_u128)
+                                .and_then(|v| v.checked_div(10_000))
+                                .or_else(|| {
+                                    // u128 overflow too — divide first
+                                    stake_u128
+                                        .checked_div(10_000)
+                                        .map(|q| q.saturating_mul(bps_u128))
+                                })
+                        })
+                        .unwrap_or(stake_u128)
+                        .min(stake_u128);
+                    slash_u128 as i128
+                };
+
+                let remaining_stake = stake
+                    .checked_sub(slash)
+                    .ok_or(TrustFlowError::ArithmeticOverflow)?;
+                env.storage().persistent().set(&stake_key, &remaining_stake);
                 extend_persistent_ttl(&env, &stake_key);
 
                 let slash_count_key = DataKey::JurorSlashCount(voter.clone());
@@ -1345,10 +1457,22 @@ impl TrustFlow {
                     .persistent()
                     .get(&slash_count_key)
                     .unwrap_or(0);
-                env.storage()
-                    .persistent()
-                    .set(&slash_count_key, &(count + 1));
+                let new_count = count
+                    .checked_add(1)
+                    .ok_or(TrustFlowError::ArithmeticOverflow)?;
+                env.storage().persistent().set(&slash_count_key, &new_count);
                 extend_persistent_ttl(&env, &slash_count_key);
+
+                env.events().publish(
+                    (symbol_short!("slash"), symbol_short!("slashed")),
+                    JurorSlashed {
+                        escrow_id,
+                        juror: voter,
+                        slash_amount: slash,
+                        remaining_stake,
+                        slash_count: new_count,
+                    },
+                );
             }
         }
 
@@ -1605,7 +1729,7 @@ mod tests {
         let depositor = Address::random(env);
         let beneficiary = Address::random(env);
 
-        mint(sac, &depositor, 1_000);
+        mint(&sac, &depositor, 1_000);
         let escrow_id = client.create_escrow(&depositor, &beneficiary, &1_000);
 
         client.raise_dispute(
@@ -1861,7 +1985,44 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_dispute_before_reveal_deadline_rejected() {
+    fn test_same_salt_across_different_disputes_does_not_collide() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor1 = Address::random(&env);
+        let beneficiary1 = Address::random(&env);
+        let depositor2 = Address::random(&env);
+        let beneficiary2 = Address::random(&env);
+        let juror = Address::random(&env);
+
+        mint(&sac, &depositor1, 500);
+        mint(&sac, &depositor2, 500);
+        mint(&sac, &juror, 400);
+        client.stake(&juror, &400);
+
+        let escrow1 = client.create_escrow(&depositor1, &beneficiary1, &500);
+        let escrow2 = client.create_escrow(&depositor2, &beneficiary2, &500);
+
+        client.raise_dispute(&escrow1, &depositor1, &String::from_slice(&env, "d1"));
+        client.raise_dispute(&escrow2, &depositor2, &String::from_slice(&env, "d2"));
+
+        // Same salt and vote direction, but different disputes.
+        let salt = test_salt(&env);
+        let commitment = hash_vote(&env, true, &salt);
+        client.commit_vote(&escrow1, &juror, &commitment);
+        client.commit_vote(&escrow2, &juror, &commitment);
+
+        advance_ledger(&env, COMMIT_WINDOW_LEDGERS);
+
+        // Both reveals must succeed — commitments are keyed by
+        // (escrow_id, juror), so the same salt does not collide.
+        client.reveal_vote(&escrow1, &juror, &true, &salt);
+        client.reveal_vote(&escrow2, &juror, &true, &salt);
+    }
+
+    #[test]
+    fn test_commitment_cleared_after_reveal() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -1880,57 +2041,23 @@ mod tests {
         let salt = test_salt(&env);
         let commitment = hash_vote(&env, true, &salt);
         client.commit_vote(&escrow_id, &juror, &commitment);
+
+        // Commitment exists before reveal.
+        let commit_key = DataKey::JurorCommit(VoteKey {
+            escrow_id,
+            juror: juror.clone(),
+        });
+        assert!(env.as_contract(&client.address, || {
+            env.storage().persistent().has(&commit_key)
+        }));
+
         advance_ledger(&env, COMMIT_WINDOW_LEDGERS);
         client.reveal_vote(&escrow_id, &juror, &true, &salt);
 
-        // Reveal window is still open — too early to resolve.
-        let result = client.try_resolve_dispute(&escrow_id);
-        assert_eq!(result, Err(Ok(TrustFlowError::RevealPhaseNotEnded)));
-    }
-
-    #[test]
-    fn test_committed_but_unrevealed_vote_not_counted() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let (client, token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
-        let depositor = Address::random(&env);
-        let beneficiary = Address::random(&env);
-        let revealer = Address::random(&env);
-        let silent = Address::random(&env);
-
-        mint(&sac, &depositor, 500);
-        mint(&sac, &revealer, 200);
-        mint(&sac, &silent, 200);
-        client.stake(&revealer, &200);
-        client.stake(&silent, &200);
-
-        let escrow_id = client.create_escrow(&depositor, &beneficiary, &500);
-        client.raise_dispute(&escrow_id, &depositor, &String::from_slice(&env, "test"));
-
-        let salt = test_salt(&env);
-        let commitment = hash_vote(&env, false, &salt);
-        client.commit_vote(&escrow_id, &revealer, &commitment);
-        client.commit_vote(&escrow_id, &silent, &commitment);
-
-        advance_ledger(&env, COMMIT_WINDOW_LEDGERS);
-        // Only `revealer` reveals; `silent` commits but never reveals.
-        client.reveal_vote(&escrow_id, &revealer, &false, &salt);
-        advance_ledger(&env, REVEAL_WINDOW_LEDGERS);
-
-        // `silent`'s vote never entered the tally, so the lone revealed
-        // vote (for the beneficiary) rules unopposed.
-        let ruling = client.resolve_dispute(&escrow_id);
-        assert!(
-            !ruling,
-            "unopposed revealed vote should rule for beneficiary"
-        );
-        assert_eq!(balance(&env, &token_addr, &beneficiary), 500);
-
-        // `silent` was never counted, so they are not slashed either —
-        // they simply forfeited their say in this dispute.
-        assert_eq!(client.get_slash_count(&silent), 0);
-        assert_eq!(client.get_stake(&silent), 200);
+        // Commitment must be cleared after a successful reveal.
+        assert!(!env.as_contract(&client.address, || {
+            env.storage().persistent().has(&commit_key)
+        }));
     }
 
     // -----------------------------------------------------------------------
@@ -2093,7 +2220,7 @@ mod tests {
         // remaining stake approximates 10_000 * 0.9^3 = 7_290.
         // Due to integer truncation the result is >= 7_290 and < 7_300.
         assert!(
-            stake_r3 >= 7_290 && stake_r3 <= 7_300,
+            (7_290..=7_300).contains(&stake_r3),
             "expected ~7290 after 3×10% slashes, got {stake_r3}"
         );
     }
@@ -2250,6 +2377,91 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_dispute_before_reveal_deadline_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        let juror = Address::random(&env);
+
+        mint(&sac, &depositor, 500);
+        mint(&sac, &juror, 200);
+        client.stake(&juror, &200);
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &500);
+        client.raise_dispute(&escrow_id, &depositor, &String::from_slice(&env, "test"));
+
+        let salt = test_salt(&env);
+        let commitment = hash_vote(&env, true, &salt);
+        client.commit_vote(&escrow_id, &juror, &commitment);
+        advance_ledger(&env, COMMIT_WINDOW_LEDGERS);
+        client.reveal_vote(&escrow_id, &juror, &true, &salt);
+
+        // Reveal window is still open — resolve_dispute must be rejected.
+        let result = client.try_resolve_dispute(&escrow_id);
+        assert_eq!(result, Err(Ok(TrustFlowError::RevealPhaseNotEnded)));
+    }
+
+    #[test]
+    fn test_committed_but_unrevealed_vote_not_counted() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        let juror_a = Address::random(&env);
+        let juror_b = Address::random(&env);
+        let silent_juror = Address::random(&env);
+
+        mint(&sac, &depositor, 500);
+        mint(&sac, &juror_a, 200);
+        mint(&sac, &juror_b, 200);
+        mint(&sac, &silent_juror, 200);
+
+        client.stake(&juror_a, &200);
+        client.stake(&juror_b, &200);
+        client.stake(&silent_juror, &200);
+
+        let escrow_id = client.create_escrow(&depositor, &beneficiary, &500);
+        client.raise_dispute(&escrow_id, &depositor, &String::from_slice(&env, "test"));
+
+        let salt = test_salt(&env);
+        // All three commit, but only two reveal.
+        let commitment_for = hash_vote(&env, true, &salt);
+        let commitment_against = hash_vote(&env, false, &salt);
+        client.commit_vote(&escrow_id, &juror_a, &commitment_for);
+        client.commit_vote(&escrow_id, &juror_b, &commitment_against);
+        client.commit_vote(&escrow_id, &silent_juror, &commitment_for);
+
+        advance_ledger(&env, COMMIT_WINDOW_LEDGERS);
+
+        client.reveal_vote(&escrow_id, &juror_a, &true, &salt);
+        client.reveal_vote(&escrow_id, &juror_b, &false, &salt);
+        // silent_juror does NOT reveal
+
+        advance_ledger(&env, REVEAL_WINDOW_LEDGERS);
+        let ruling = client.resolve_dispute(&escrow_id);
+
+        // Depositor wins (1 for, 1 against, tie favours depositor)
+        assert!(ruling, "tie should rule for depositor");
+
+        // juror_b voted against and must be slashed
+        assert_eq!(client.get_slash_count(&juror_b), 1);
+        assert!(client.get_stake(&juror_b) < 200);
+
+        // silent_juror committed but never revealed — no slash, no vote counted
+        assert_eq!(client.get_slash_count(&silent_juror), 0);
+        assert_eq!(client.get_stake(&silent_juror), 200);
+
+        // juror_a voted with majority — no slash
+        assert_eq!(client.get_slash_count(&juror_a), 0);
+        assert_eq!(client.get_stake(&juror_a), 200);
+    }
+
+    #[test]
     fn test_slash_cannot_exceed_stake() {
         let env = Env::default();
         env.mock_all_auths();
@@ -2301,11 +2513,13 @@ mod tests {
                     label: String::from_slice(&env, "Design"),
                     amount: 400,
                     approved: false,
+                    release_time: 0,
                 },
                 Milestone {
                     label: String::from_slice(&env, "Development"),
                     amount: 600,
                     approved: false,
+                    release_time: 0,
                 },
             ],
         );
@@ -2411,6 +2625,11 @@ mod tests {
             &depositor,
             &String::from_slice(&env, "slow juror"),
         );
+
+        // Commit before the large ledger advance (which would blow past the
+        // commit deadline).
+        let commitment = hash_vote(&env, true, &test_salt(&env));
+        client.commit_vote(&escrow_id, &juror, &commitment);
 
         // A keeper sweep well before anything would lapse: bumps the escrow
         // (and its dispute) as well as the juror's still-idle stake, since
@@ -2607,6 +2826,7 @@ mod tests {
                 label: String::from_slice(env, "Milestone 1"),
                 amount: milestone_amount,
                 approved: false,
+                release_time: 0, // No time-lock for backward compatibility
             }],
         );
         let escrow_id = client.init_escrow(&depositor, &beneficiary, &milestones);
@@ -2753,11 +2973,13 @@ mod tests {
                     label: String::from_slice(&env, "M1"),
                     amount: 400,
                     approved: false,
+                    release_time: 0,
                 },
                 Milestone {
                     label: String::from_slice(&env, "M2"),
                     amount: 600,
                     approved: false,
+                    release_time: 0,
                 },
             ],
         );
@@ -3058,6 +3280,190 @@ mod tests {
 
         let result = client.try_release_milestone_tranche(&escrow_id, &0u32, &1, &depositor);
         assert_eq!(result, Err(Ok(TrustFlowError::InvalidState)));
+    }
+
+    #[test]
+    fn test_milestone_time_locked_rejects_early_release() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        mint(&sac, &depositor, 1_000);
+
+        // Set release_time to future ledger (current + 100)
+        let current_ledger = env.ledger().sequence();
+        let future_ledger = current_ledger + 100;
+
+        let milestones = Vec::from_array(
+            &env,
+            [Milestone {
+                label: String::from_slice(&env, "Milestone 1"),
+                amount: 1_000,
+                approved: false,
+                release_time: future_ledger,
+            }],
+        );
+        let escrow_id = client.init_escrow(&depositor, &beneficiary, &milestones);
+
+        // Attempt to release before time-lock expires should fail
+        let result = client.try_release_milestone_tranche(&escrow_id, &0u32, &1_000, &depositor);
+        assert_eq!(result, Err(Ok(TrustFlowError::MilestoneTimeLocked)));
+    }
+
+    #[test]
+    fn test_milestone_time_locked_allows_release_after_deadline() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        mint(&sac, &depositor, 1_000);
+
+        // Set release_time to future ledger (current + 10)
+        let current_ledger = env.ledger().sequence();
+        let release_ledger = current_ledger + 10;
+
+        let milestones = Vec::from_array(
+            &env,
+            [Milestone {
+                label: String::from_slice(&env, "Milestone 1"),
+                amount: 1_000,
+                approved: false,
+                release_time: release_ledger,
+            }],
+        );
+        let escrow_id = client.init_escrow(&depositor, &beneficiary, &milestones);
+
+        // Attempt to release before time-lock expires should fail
+        let result = client.try_release_milestone_tranche(&escrow_id, &0u32, &1_000, &depositor);
+        assert_eq!(result, Err(Ok(TrustFlowError::MilestoneTimeLocked)));
+
+        // Advance ledger past release_time
+        advance_ledger(&env, 10);
+
+        // Release should now succeed
+        client.release_milestone_tranche(&escrow_id, &0u32, &1_000, &depositor);
+
+        // Verify funds were transferred
+        assert_eq!(balance(&env, &token_addr, &beneficiary), 995); // 1000 - 5 (50bps fee)
+    }
+
+    #[test]
+    fn test_milestone_time_locked_partial_release() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        mint(&sac, &depositor, 1_000);
+
+        // Set release_time to future ledger (current + 10)
+        let current_ledger = env.ledger().sequence();
+        let release_ledger = current_ledger + 10;
+
+        let milestones = Vec::from_array(
+            &env,
+            [Milestone {
+                label: String::from_slice(&env, "Milestone 1"),
+                amount: 1_000,
+                approved: false,
+                release_time: release_ledger,
+            }],
+        );
+        let escrow_id = client.init_escrow(&depositor, &beneficiary, &milestones);
+
+        // Partial release before time-lock should fail
+        let result = client.try_release_milestone_tranche(&escrow_id, &0u32, &500, &depositor);
+        assert_eq!(result, Err(Ok(TrustFlowError::MilestoneTimeLocked)));
+
+        // Advance ledger past release_time
+        advance_ledger(&env, 10);
+
+        // Partial release should now succeed
+        client.release_milestone_tranche(&escrow_id, &0u32, &500, &depositor);
+        assert_eq!(balance(&env, &token_addr, &beneficiary), 498); // 500 - 2 (50bps fee rounded)
+
+        // Second partial release should also succeed
+        client.release_milestone_tranche(&escrow_id, &0u32, &500, &depositor);
+        assert_eq!(balance(&env, &token_addr, &beneficiary), 995); // 1000 - 5 total
+    }
+
+    #[test]
+    fn test_multiple_milestones_different_time_locks() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        mint(&sac, &depositor, 1_000);
+
+        let current_ledger = env.ledger().sequence();
+
+        let milestones = Vec::from_array(
+            &env,
+            [
+                Milestone {
+                    label: String::from_slice(&env, "M1"),
+                    amount: 400,
+                    approved: false,
+                    release_time: current_ledger, // Immediately available
+                },
+                Milestone {
+                    label: String::from_slice(&env, "M2"),
+                    amount: 600,
+                    approved: false,
+                    release_time: current_ledger + 20, // Locked for 20 ledgers
+                },
+            ],
+        );
+        let escrow_id = client.init_escrow(&depositor, &beneficiary, &milestones);
+
+        // M1 should be immediately releasable
+        client.release_milestone_tranche(&escrow_id, &0u32, &400, &depositor);
+        assert_eq!(balance(&env, &token_addr, &beneficiary), 398); // 400 - 2 (50bps fee rounded)
+
+        // M2 should be time-locked
+        let result = client.try_release_milestone_tranche(&escrow_id, &1u32, &600, &depositor);
+        assert_eq!(result, Err(Ok(TrustFlowError::MilestoneTimeLocked)));
+
+        // Advance ledger past M2's release_time
+        advance_ledger(&env, 20);
+
+        // M2 should now be releasable
+        client.release_milestone_tranche(&escrow_id, &1u32, &600, &depositor);
+        assert_eq!(balance(&env, &token_addr, &beneficiary), 995); // 1000 - 5 total
+    }
+
+    #[test]
+    fn test_milestone_no_time_lock_immediate_release() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, token_addr, sac) = setup(&env, DEFAULT_SLASH_BPS);
+        let depositor = Address::random(&env);
+        let beneficiary = Address::random(&env);
+        mint(&sac, &depositor, 1_000);
+
+        // Set release_time to 0 (no time-lock)
+        let milestones = Vec::from_array(
+            &env,
+            [Milestone {
+                label: String::from_slice(&env, "Milestone 1"),
+                amount: 1_000,
+                approved: false,
+                release_time: 0,
+            }],
+        );
+        let escrow_id = client.init_escrow(&depositor, &beneficiary, &milestones);
+
+        // Should be immediately releasable
+        client.release_milestone_tranche(&escrow_id, &0u32, &1_000, &depositor);
+        assert_eq!(balance(&env, &token_addr, &beneficiary), 995); // 1000 - 5 (50bps fee)
     }
 
     #[test]
@@ -3546,6 +3952,7 @@ mod tests {
                 label: String::from_slice(&env, "M1"),
                 amount: 50_000,
                 approved: false,
+                release_time: 0,
             }
         ];
         assert_eq!(
@@ -3652,6 +4059,7 @@ mod tests {
                 label: String::from_slice(&env, "M1"),
                 amount: 50_000,
                 approved: false,
+                release_time: 0,
             }
         ];
         let escrow_id = client.init_escrow(&depositor, &beneficiary, &milestones);
